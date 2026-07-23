@@ -1,20 +1,36 @@
 # pringle-wallet
 
-A small, single-binary Rust CLI built on [`chia-wallet-sdk`](https://crates.io/crates/chia-wallet-sdk)
-that demonstrates an end-to-end flow on **Chia mainnet**:
+A small, single-binary Rust CLI for creating and trading options on income streams paid to
+NFT-controlled `p2 singleton` addresses. It was built primarily to experiment with options on
+[potpotato.xyz](https://potpotato.xyz/) income streams.
+
+Pringle uses [`chia-wallet-sdk`](https://crates.io/crates/chia-wallet-sdk) to provide an
+end-to-end flow on **Chia mainnet**:
 
 1. Generate and locally store a BLS key, and derive a standard `xch` wallet address.
 2. Discover, consolidate, and send regular XCH coins through the public
    [coinset.org](https://api.coinset.org) API.
 3. Mint a singleton NFT owned by the wallet.
-4. Derive and fund a `p2 singleton` address that the NFT controls.
+4. Derive a `p2 singleton` address that receives income and can only be spent with the NFT.
 5. Create an option contract whose *underlying* asset is that NFT, with an XCH strike price.
 6. Sell (offer/take) or exercise the option.
 
-Because the NFT is the option underlying, whoever controls the NFT controls the funds locked in
-its `p2 singleton` (those coins can only be spent by co-spending the NFT singleton). Exercising the
-option transfers the NFT, and therefore control of the attached `p2 singleton` funds, to the
-exerciser. Creating, funding, offering, taking, exercising, and sweeping are all implemented.
+## Income-stream options
+
+The NFT acts as the control key for its deterministic `p2 singleton` address. Income can continue
+arriving at that address while the NFT is locked in an option. Those coins cannot be swept without
+co-spending the NFT, so the option writer cannot withdraw them while the NFT remains locked.
+
+The option holder can exercise before expiration by paying the XCH strike. Exercise transfers the
+NFT and therefore control of the accumulated p2-singleton balance—and any future income sent to
+the same address—to the exerciser. The traded option coin is therefore an option on the NFT that
+controls the income stream, rather than an option on each individual incoming XCH coin.
+
+This model was designed mainly for potpotato.xyz revenue streams: route the stream to an
+NFT-controlled p2 singleton, lock that NFT as the option underlying, and trade the option using a
+Chia offer file. Pringle can also fund these addresses directly for testing.
+
+Creating, funding, offering, taking, exercising, and sweeping are all implemented.
 **Clawback (reclaiming the underlying after expiration) is not yet supported.**
 
 > [!WARNING]
