@@ -1,0 +1,145 @@
+//! Black-box CLI smoke tests for the offline command paths (no network access).
+//!
+//! These exercise output discipline (bare address, JSON envelopes, quiet mode) and basic
+//! wiring via the real binary, without ever touching mainnet.
+
+use assert_cmd::Command;
+use predicates::prelude::*;
+use tempfile::tempdir;
+
+/// A `pringle` command with isolated key/state files under `dir`.
+fn pringle(dir: &std::path::Path) -> Command {
+    let mut cmd = Command::cargo_bin("pringle").unwrap();
+    cmd.arg("--key-file")
+        .arg(dir.join("k.hex"))
+        .arg("--state-file")
+        .arg(dir.join("s.json"));
+    cmd
+}
+
+#[test]
+fn help_lists_commands() {
+    Command::cargo_bin("pringle")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage"))
+        .stdout(predicate::str::contains("xch"))
+        .stdout(predicate::str::contains("option"))
+        .stdout(predicate::str::contains("p2-singleton"));
+}
+
+#[test]
+fn xch_help_lists_consolidate_and_send_all() {
+    Command::cargo_bin("pringle")
+        .unwrap()
+        .args(["xch", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("consolidate"))
+        .stdout(predicate::str::contains("send-all"));
+}
+
+#[test]
+fn option_show_all_help_exposes_history_and_cached_flags() {
+    Command::cargo_bin("pringle")
+        .unwrap()
+        .args(["option", "show-all", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--include-closed"))
+        .stdout(predicate::str::contains("--cached"));
+}
+
+#[test]
+fn init_creates_key_and_state() {
+    let dir = tempdir().unwrap();
+    pringle(dir.path())
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Initialized new wallet"));
+    assert!(dir.path().join("k.hex").exists());
+    assert!(dir.path().join("s.json").exists());
+}
+
+#[test]
+fn address_prints_only_the_address_by_default() {
+    let dir = tempdir().unwrap();
+    pringle(dir.path()).arg("init").assert().success();
+
+    let out = pringle(dir.path()).arg("address").output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    // Exactly one line, and it is the bech32m address.
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected a single bare address line, got {stdout:?}"
+    );
+    assert!(lines[0].starts_with("xch1"));
+}
+
+#[test]
+fn address_verbose_includes_puzzle_hash() {
+    let dir = tempdir().unwrap();
+    pringle(dir.path()).arg("init").assert().success();
+
+    pringle(dir.path())
+        .arg("address")
+        .arg("--verbose")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("puzzle hash:"));
+}
+
+#[test]
+fn address_json_is_a_valid_envelope() {
+    let dir = tempdir().unwrap();
+    pringle(dir.path()).arg("init").assert().success();
+
+    let out = pringle(dir.path())
+        .arg("--json")
+        .arg("address")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["kind"], "address");
+    assert!(value["address"].as_str().unwrap().starts_with("xch1"));
+    assert!(value["puzzle_hash"].as_str().unwrap().starts_with("0x"));
+}
+
+#[test]
+fn status_cached_json_is_empty_but_valid() {
+    let dir = tempdir().unwrap();
+    pringle(dir.path()).arg("init").assert().success();
+
+    let out = pringle(dir.path())
+        .arg("--json")
+        .arg("status")
+        .arg("--cached")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["kind"], "status");
+    assert!(value["nfts"].as_array().unwrap().is_empty());
+    assert!(value["options"].as_array().unwrap().is_empty());
+    assert!(value["p2_singletons"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn missing_key_gives_a_clear_error() {
+    let dir = tempdir().unwrap();
+    // No `init`: address should fail with a helpful message and a non-zero exit code.
+    pringle(dir.path())
+        .arg("address")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no key file"));
+}
