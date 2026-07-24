@@ -237,4 +237,20 @@ pub enum OptionCommand {
         #[arg(long)]
         launcher: Option<String>,
     },
+    /// Reclaim the underlying NFT of an expired option you created (creator-only clawback).
+    ///
+    /// Only works after the option's expiration deadline has passed. The expired option coin
+    /// is left untouched; once the reclaimed NFT confirms, use `p2-singleton sweep` to
+    /// withdraw its accumulated income.
+    Clawback {
+        /// Destination address for the reclaimed NFT owner (defaults to the wallet address).
+        #[arg(long)]
+        address: Option<String>,
+        /// Transaction fee in mojos (funded from separate regular-XCH coins).
+        #[arg(long, default_value_t = 0)]
+        fee: u64,
+        /// Which option to claw back, by launcher id (required only when several are tracked).
+        #[arg(long)]
+        launcher: Option<String>,
+    },
 }

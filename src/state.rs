@@ -283,6 +283,12 @@ pub struct OptionRecord {
     /// false for a purchased option whose terms have not yet been recovered from the chain.
     #[serde(default = "default_true")]
     pub terms_known: bool,
+    /// True once the creator has clawed back the underlying NFT after expiry. The option
+    /// singleton is left inert (never melted by clawback), so this flag distinguishes an
+    /// expired-but-reclaimed option from one merely awaiting clawback. Defaults to false for
+    /// records written before this field existed.
+    #[serde(default)]
+    pub underlying_reclaimed: bool,
 }
 
 fn default_true() -> bool {
@@ -642,6 +648,26 @@ mod tests {
         // Replacing an existing launcher does not add a duplicate.
         state.upsert_nft(sample_nft("0xaa"));
         assert_eq!(state.nfts.len(), 2);
+    }
+
+    #[test]
+    fn option_record_defaults_underlying_reclaimed_to_false() {
+        // A record written before the `underlying_reclaimed` field must still deserialize,
+        // defaulting the new field to false (not yet reclaimed).
+        let json = serde_json::json!({
+            "launcher_id": "0xaa",
+            "coin": {"parent_coin_info": "0x01", "puzzle_hash": "0x02", "amount": 1},
+            "underlying_nft_coin": {"parent_coin_info": "0x03", "puzzle_hash": "0x04", "amount": 1},
+            "underlying_delegated_puzzle_hash": "0x05",
+            "strike_amount": 1000,
+            "expiration_seconds": 2000,
+            "creator_puzzle_hash": "0x06",
+            "owner_puzzle_hash": "0x07",
+            "phase": "confirmed"
+        });
+        let record: OptionRecord = serde_json::from_value(json).unwrap();
+        assert!(!record.underlying_reclaimed);
+        assert!(record.terms_known); // also defaults to true
     }
 
     #[test]

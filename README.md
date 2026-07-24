@@ -30,8 +30,9 @@ This model was designed mainly for potpotato.xyz revenue streams: route the stre
 NFT-controlled p2 singleton, lock that NFT as the option underlying, and trade the option using a
 Chia offer file. Pringle can also fund these addresses directly for testing.
 
-Creating, funding, offering, taking, exercising, and sweeping are all implemented.
-**Clawback (reclaiming the underlying after expiration) is not yet supported.**
+Creating, funding, offering, taking, exercising, sweeping, and clawback are all implemented.
+If an option expires unexercised, its creator can reclaim the locked NFT with `pringle option
+clawback` (see [Expired options](#expired-options)); no option "melt" is required.
 
 > [!WARNING]
 > This tool operates on **mainnet with real XCH** and stores your private key **unencrypted** on
@@ -134,6 +135,11 @@ pringle option exercise --fee 100000
 # When several options are open, copy the full launcher id from `show-all`:
 pringle option exercise --launcher 0x... --fee 100000
 
+# 6c. Or, if the option expires unexercised, the creator reclaims the locked NFT (clawback).
+# Only works after the expiration deadline; the expired option coin is left untouched.
+pringle option clawback --fee 100000
+pringle option clawback --launcher 0x... --address xch1... --fee 100000
+
 # At any point, review local lifecycle state (refreshed against the chain by default).
 pringle status
 pringle status --cached   # local snapshot only, no network
@@ -142,6 +148,25 @@ pringle status --cached   # local snapshot only, no network
 pringle sync
 ```
 
+### Expired options
+
+Expiration only disables *exercise* (enforced on-chain by `ASSERT_BEFORE_SECONDS_ABSOLUTE`); it
+does **not** move the underlying NFT automatically. If an option you created expires unexercised,
+the NFT stays locked in the option underlying until you reclaim it. Because clawback spends only
+the underlying's time-locked creator path, the option singleton is never melted — it simply
+remains as an inert expired coin.
+
+Reclaiming is a two-step, creator-only flow:
+
+1. `pringle option clawback` — spends the locked NFT through its clawback path (which enforces the
+   expiry deadline with `ASSERT_SECONDS_ABSOLUTE` and requires the creator's key) and recreates
+   the NFT under your control. Any fee is funded from separate regular-XCH coins.
+2. After `pringle status` shows the NFT as *Ready*, run `pringle p2-singleton sweep` to withdraw
+   the income the NFT's p2 singleton accumulated while the option was live.
+
+`pringle status` and `pringle option show-all --include-closed` flag eligible options with a
+copyable clawback command and report a reclaimed option as *Expired (NFT reclaimed)*.
+
 Option offer files use the wallet SDK's option primitive. At the time of writing, Sage does not
 support NFT-backed option underlyings, so these offers must be viewed, taken, and exercised with a
 compatible tool such as Pringle.
@@ -149,8 +174,9 @@ compatible tool such as Pringle.
 ## How status and sync work
 
 `pringle status` reconciles against the chain by default and then reports each asset with an
-intuitive state — *Ready*, *Pending confirmation*, *Locked in option*, *Expired*, *Exercised*,
-*Closed*, *Transferred*, *Empty*, or *Unknown* — hiding raw phases and coin ids unless
+intuitive state — *Ready*, *Pending confirmation*, *Locked in option*, *Expired*, *Expired (NFT
+reclaimed)*, *Exercised*, *Closed*, *Transferred*, *Empty*, or *Unknown* — hiding raw phases and
+coin ids unless
 `--verbose`. It also derives missing p2-singleton tracking records and refreshes their combined
 confirmed balances. Use `--cached` for a no-network snapshot, which may be stale.
 

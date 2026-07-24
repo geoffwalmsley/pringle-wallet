@@ -169,6 +169,21 @@ async fn dispatch(cli: Cli) -> Result<()> {
             OptionCommand::Recover { launcher } => {
                 cmd_option_recover(&state_file, launcher.as_deref()).await
             }
+            OptionCommand::Clawback {
+                address,
+                fee,
+                launcher,
+            } => {
+                cmd_option_clawback(
+                    &key_file,
+                    &state_file,
+                    address,
+                    fee,
+                    launcher.as_deref(),
+                    yes,
+                )
+                .await
+            }
         },
         Command::Status { cached } => cmd_status(&key_file, &state_file, cached).await,
         Command::Sync => cmd_sync(&key_file, &state_file).await,
@@ -920,7 +935,9 @@ async fn cmd_option_show_all(
         }
 
         let user_state = if cached {
-            if expired {
+            if option.underlying_reclaimed {
+                status_view::UserState::Reclaimed
+            } else if expired {
                 status_view::UserState::Expired
             } else if option.phase == Phase::Pending {
                 status_view::UserState::PendingConfirmation
@@ -937,7 +954,13 @@ async fn cmd_option_show_all(
             }
         } else {
             let chain = coinset.classify(option.coin.to_coin()?.coin_id()).await;
-            status_view::option_state(option.phase, &chain, controlled, expired)
+            status_view::option_state(
+                option.phase,
+                &chain,
+                controlled,
+                expired,
+                option.underlying_reclaimed,
+            )
         };
         shown.push((option, user_state, open));
     }
@@ -957,6 +980,8 @@ async fn cmd_option_show_all(
                     "owner_puzzle_hash": option.owner_puzzle_hash,
                     "nft_launcher_id": option.nft_launcher_id,
                     "origin": option.origin,
+                    "underlying_reclaimed": option.underlying_reclaimed,
+                    "clawback_available": clawback_eligible(option, Some(wallet.puzzle_hash()), now),
                 })
             })
             .collect::<Vec<_>>();
@@ -1015,6 +1040,12 @@ async fn cmd_option_show_all(
         if open && option.terms_known {
             println!(
                 "  Exercise:   pringle option exercise --launcher {}",
+                option.launcher_id
+            );
+        }
+        if clawback_eligible(option, Some(wallet.puzzle_hash()), now) {
+            println!(
+                "  Clawback:   pringle option clawback --launcher {}",
                 option.launcher_id
             );
         }
@@ -1684,6 +1715,160 @@ async fn cmd_option_exercise(
     Ok(())
 }
 
+async fn cmd_option_clawback(
+    key_file: &Path,
+    state_file: &Path,
+    address: Option<String>,
+    fee: u64,
+    launcher: Option<&str>,
+    assume_yes: bool,
+) -> Result<()> {
+    let wallet = load_wallet(key_file)?;
+    let mut state = State::load(state_file)?;
+
+    let option = state.select_option(launcher)?;
+    if option.underlying_reclaimed {
+        return Err(AppError::recoverable(
+            "the underlying NFT for this option has already been reclaimed",
+        )
+        .into());
+    }
+    if !option.terms_known {
+        return Err(AppError::recoverable(
+            "this option's terms are not known (it was purchased and not yet recovered)",
+        )
+        .next("run `pringle option recover` first")
+        .into());
+    }
+
+    // Only the creator can claw back. Being the owner (or having transferred the option to a
+    // buyer) is irrelevant: the underlying's clawback path is keyed to the creator.
+    let creator_puzzle_hash = from_hex(&option.creator_puzzle_hash)?;
+    if creator_puzzle_hash != wallet.puzzle_hash() {
+        return Err(AppError::recoverable(
+            "this wallet is not the option creator; only the creator can claw back the NFT",
+        )
+        .into());
+    }
+
+    let now = now_seconds();
+    if now < option.expiration_seconds {
+        return Err(AppError::recoverable(format!(
+            "option has not expired yet (expires {})",
+            format::expiration(option.expiration_seconds, now)
+        ))
+        .why("clawback is only allowed after the expiration deadline")
+        .next("wait until it expires, or exercise it before then")
+        .into());
+    }
+
+    // Locate the locked underlying NFT record (linked by launcher id when known).
+    let nft_record = match &option.nft_launcher_id {
+        Some(id) => state.nft_by_launcher(id).cloned().ok_or_else(|| {
+            AppError::recoverable("the option's underlying NFT is not tracked")
+                .next("run `pringle option recover`")
+        })?,
+        None => {
+            return Err(
+                AppError::recoverable("the option's underlying NFT is not linked")
+                    .next("run `pringle option recover` first")
+                    .into(),
+            )
+        }
+    };
+
+    let (reclaim_puzzle_hash, reclaim_label) = match &address {
+        Some(addr) => (parse_address(addr)?, addr.clone()),
+        None => (wallet.puzzle_hash(), wallet.address()?),
+    };
+
+    let coinset = Coinset::mainnet();
+    let nft_coin = nft_record.coin.to_coin()?;
+    require_confirmed_unspent(&coinset, nft_coin.coin_id(), "locked NFT").await?;
+
+    // Fund the fee from separate regular-XCH coins (the NFT clawback provides no value).
+    let fee_selection = if fee > 0 {
+        let coins = wallet_spendable_coins(&coinset, &wallet, &state).await?;
+        Some(select_for(coins, 0, fee)?)
+    } else {
+        None
+    };
+
+    let launcher_id = from_hex(&option.launcher_id)?;
+    let preview = ActionPreview::new("Clawback expired option")
+        .detail("Option launcher", option.launcher_id.clone())
+        .detail("Reclaim NFT", nft_record.launcher_id.clone())
+        .detail("NFT owner", reclaim_label.clone())
+        .detail("Fee", format::xch(fee));
+    if !confirm_or_abort(&preview, assume_yes)? {
+        return Ok(());
+    }
+
+    let mut ctx = SpendContext::new();
+    let locked_nft = nft::nft_from_record(&mut ctx, &nft_record)?;
+    let outcome = option_contract::build_clawback(
+        &mut ctx,
+        &wallet.standard_layer(),
+        launcher_id,
+        locked_nft,
+        creator_puzzle_hash,
+        option.expiration_seconds,
+        option.strike_amount,
+        reclaim_puzzle_hash,
+        fee_selection.as_ref(),
+        wallet.puzzle_hash(),
+        fee,
+    )?;
+
+    let bundle = sign_spend_bundle(ctx.take(), &[wallet.synthetic_secret_key().clone()])?;
+    coinset.push_tx(bundle).await?;
+
+    let mut spent_ids = vec![to_hex(nft_coin.coin_id())];
+    if let Some(selection) = &fee_selection {
+        spent_ids.extend(selection_spent_ids(selection));
+    }
+    state.transactions.push(TxRecord::new(
+        "option_clawback",
+        spent_ids,
+        to_hex(outcome.nft.coin.coin_id()),
+    ));
+
+    // The reclaimed NFT is pending under the new owner; mark the option's underlying as
+    // reclaimed. The option singleton itself is untouched, so leave its phase alone.
+    if let Some(rec) = state.nft_mut(&nft_record.launcher_id) {
+        rec.coin = CoinJson::from_coin(outcome.nft.coin);
+        rec.proof = ProofJson::from_proof(outcome.nft.proof);
+        rec.p2_puzzle_hash = to_hex(outcome.nft.info.p2_puzzle_hash);
+        rec.current_owner = outcome.nft.info.current_owner.map(to_hex);
+        rec.phase = Phase::Pending;
+    }
+    if let Some(rec) = state.option_mut(&option.launcher_id) {
+        rec.underlying_reclaimed = true;
+    }
+    state.save(state_file)?;
+
+    let mut report = Report::new("option_clawback", "Submitted expired option clawback.");
+    if fee > 0 {
+        report.field_json("Fee", format::xch(fee), "fee_mojos", Value::from(fee));
+    }
+    report
+        .field("Option launcher", &option.launcher_id, "launcher_id")
+        .field("NFT reclaimed", &nft_record.launcher_id, "nft_launcher_id")
+        .primary()
+        .field(
+            "New NFT coin",
+            to_hex(outcome.nft.coin.coin_id()),
+            "new_nft_coin_id",
+        )
+        .field("NFT owner", reclaim_label, "reclaim_address")
+        .note(
+            "Submitted, not yet confirmed. Once `pringle status` shows the NFT as Ready, run\n\
+             `pringle p2-singleton sweep` to withdraw its accumulated income.",
+        );
+    report.emit();
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // status / sync
 // ---------------------------------------------------------------------------
@@ -1788,7 +1973,13 @@ async fn cmd_status(key_file: &Path, state_file: &Path, cached: bool) -> Result<
         };
         let controlled = wallet_ph == from_hex(&option.owner_puzzle_hash).ok();
         let expired = option.terms_known && now >= option.expiration_seconds;
-        let user = status_view::option_state(option.phase, &status, controlled, expired);
+        let user = status_view::option_state(
+            option.phase,
+            &status,
+            controlled,
+            expired,
+            option.underlying_reclaimed,
+        );
         option_views.push((option, coin, status, user, expired));
     }
 
@@ -1861,11 +2052,18 @@ async fn cmd_status(key_file: &Path, state_file: &Path, cached: bool) -> Result<
         } else {
             println!("      terms:      unknown (run `pringle option recover`)");
         }
+        if clawback_eligible(option, wallet_ph, now) {
+            println!(
+                "      clawback:   available — pringle option clawback --launcher {}",
+                option.launcher_id
+            );
+        }
         if output::is_verbose() {
             println!("      coin:       {}", to_hex(coin.coin_id()));
             println!("      owner:      {}", option.owner_puzzle_hash);
             println!("      origin:     {:?}", option.origin);
             println!("      phase:      {:?}", option.phase);
+            println!("      reclaimed:  {}", option.underlying_reclaimed);
             println!("      on-chain:   {}", status.label());
         }
     }
@@ -1882,6 +2080,17 @@ async fn cmd_status(key_file: &Path, state_file: &Path, cached: bool) -> Result<
     }
 
     Ok(())
+}
+
+/// Whether an option is eligible for a creator clawback of its expired underlying NFT:
+/// terms known, created by this wallet, past expiry, not yet reclaimed, and its NFT linked.
+fn clawback_eligible(option: &OptionRecord, wallet_ph: Option<Bytes32>, now: u64) -> bool {
+    option.terms_known
+        && !option.underlying_reclaimed
+        && option.nft_launcher_id.is_some()
+        && now >= option.expiration_seconds
+        && wallet_ph.is_some()
+        && from_hex(&option.creator_puzzle_hash).ok() == wallet_ph
 }
 
 /// Abbreviates an id for human display unless verbose mode is on.
@@ -1937,6 +2146,8 @@ fn emit_status_json(state: &State, nfts: &[NftView], options: &[OptionView]) {
         })
         .collect();
 
+    let now = now_seconds();
+    let wallet_ph = from_hex(&state.wallet_puzzle_hash).ok();
     let options_json: Vec<Value> = options
         .iter()
         .map(|(option, coin, status, user, expired)| {
@@ -1949,6 +2160,8 @@ fn emit_status_json(state: &State, nfts: &[NftView], options: &[OptionView]) {
                 "strike_mojos": option.strike_amount,
                 "expiration_seconds": option.expiration_seconds,
                 "expired": expired,
+                "underlying_reclaimed": option.underlying_reclaimed,
+                "clawback_available": clawback_eligible(option, wallet_ph, now),
                 "origin": format!("{:?}", option.origin).to_lowercase(),
             })
         })

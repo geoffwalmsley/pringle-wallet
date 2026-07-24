@@ -12,13 +12,14 @@ use chia_wallet_sdk::chia::puzzle_types::offer::{
 use chia_wallet_sdk::chia::puzzle_types::Memos;
 use chia_wallet_sdk::driver::DriverError;
 use chia_wallet_sdk::prelude::{
-    run_puzzle, Action, Allocator, AssetInfo, Bytes32, Coin, CoinSpend, Condition, Conditions,
-    FromClvm, Id, Layer, Nft, NodePtr, Offer, OptionContract, OptionInfo, OptionLauncher,
-    OptionLauncherInfo, OptionType, OptionUnderlying, PublicKey, Puzzle, Relation,
-    RequestedPayments, SettlementLayer, SingletonInfo, SpendBundle, SpendContext, Spends,
-    StandardLayer, ToClvm, ToTreeHash,
+    run_puzzle, Action, Allocator, AssetInfo, Bytes, Bytes32, Coin, CoinSpend, Condition,
+    Conditions, FromClvm, Id, Layer, Nft, NodePtr, Offer, OptionContract, OptionInfo,
+    OptionLauncher, OptionLauncherInfo, OptionType, OptionUnderlying, PublicKey, Puzzle, Relation,
+    RequestedPayments, SettlementLayer, SingletonInfo, SpendBundle, SpendContext,
+    SpendWithConditions, Spends, StandardLayer, ToClvm, ToTreeHash,
 };
 use chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH;
+use chia_wallet_sdk::types::announcement_id;
 use indexmap::IndexMap;
 
 use crate::state::{from_hex, to_hex, CoinJson, OptionOrigin, OptionRecord, Phase, ProofJson};
@@ -120,6 +121,7 @@ pub fn option_to_record(
         nft_launcher_id: Some(to_hex(outcome.locked_nft.info.launcher_id)),
         origin: OptionOrigin::Created,
         terms_known: true,
+        underlying_reclaimed: false,
     }
 }
 
@@ -291,6 +293,7 @@ pub fn purchased_option_record(outcome: &TakeOutcome, owner_puzzle_hash: Bytes32
         nft_launcher_id: None,
         origin: OptionOrigin::Purchased,
         terms_known: false,
+        underlying_reclaimed: false,
     }
 }
 
@@ -541,4 +544,93 @@ pub fn build_exercise(
         nft,
         strike_settlement_coin,
     })
+}
+
+/// The announcement message binding the fee-paying inputs to the NFT clawback spend, so the
+/// fee cannot be confirmed on its own without also reclaiming the NFT.
+const CLAWBACK_BIND_NONCE: &[u8] = b"pringle-clawback";
+
+/// The result of clawing back an expired option's underlying NFT.
+#[derive(Debug, Clone)]
+pub struct ClawbackOutcome {
+    /// The reclaimed NFT, recreated under the creator's control.
+    pub nft: Nft,
+}
+
+/// Builds a creator clawback of an expired option's underlying NFT.
+///
+/// After the option's absolute expiration passes, the creator can reclaim the locked NFT
+/// through the underlying puzzle's time-locked clawback path, which enforces
+/// `ASSERT_SECONDS_ABSOLUTE` (the expiry deadline) and requires the creator's key. The NFT is
+/// recreated at `reclaim_puzzle_hash`, still without an assigned owner.
+///
+/// The option singleton is deliberately not spent: clawback only touches the underlying, so
+/// the expired option coin remains as an inert singleton. Any `fee` is funded from separate
+/// regular-XCH `fee_selection` inputs, which are bound to the NFT spend by a coin
+/// announcement so they cannot be confirmed without the reclaim.
+#[allow(clippy::too_many_arguments)]
+pub fn build_clawback(
+    ctx: &mut SpendContext,
+    creator_layer: &StandardLayer,
+    option_launcher_id: Bytes32,
+    locked_nft: Nft,
+    creator_puzzle_hash: Bytes32,
+    expiration_seconds: u64,
+    strike_amount: u64,
+    reclaim_puzzle_hash: Bytes32,
+    fee_selection: Option<&Selection>,
+    change_puzzle_hash: Bytes32,
+    fee: u64,
+) -> Result<ClawbackOutcome> {
+    let underlying_amount = locked_nft.coin.amount;
+    let underlying = OptionUnderlying::new(
+        option_launcher_id,
+        creator_puzzle_hash,
+        expiration_seconds,
+        underlying_amount,
+        OptionType::Xch {
+            amount: strike_amount,
+        },
+    );
+
+    // The reconstructed underlying must match the puzzle the NFT is actually locked in.
+    if Bytes32::from(underlying.tree_hash()) != locked_nft.info.p2_puzzle_hash {
+        anyhow::bail!(
+            "reconstructed option underlying does not match the locked NFT; state may be inconsistent"
+        );
+    }
+
+    // Recreate the NFT under the creator's control. When a fee is paid from separate coins,
+    // emit an announcement from this spend so those coins can be bound to it.
+    let hint = ctx.hint(reclaim_puzzle_hash)?;
+    let mut inner = Conditions::new().create_coin(reclaim_puzzle_hash, underlying_amount, hint);
+    if fee > 0 {
+        let message: Bytes = CLAWBACK_BIND_NONCE.to_vec().into();
+        inner = inner.create_coin_announcement(message);
+    }
+
+    // The clawback path wraps the creator's standard spend in the time-locked augmented layer
+    // (which prepends the `ASSERT_SECONDS_ABSOLUTE` deadline) and the underlying's 1-of-n.
+    let inner_spend = creator_layer.spend_with_conditions(ctx, inner)?;
+    let clawback_spend = underlying.clawback_spend(ctx, inner_spend)?;
+    let nft = locked_nft.spend(ctx, clawback_spend)?;
+
+    // Fund the fee from separate regular-XCH inputs, bound to the NFT spend.
+    if fee > 0 {
+        let selection = fee_selection.ok_or_else(|| {
+            anyhow::anyhow!("a fee was requested but no coins were provided to pay it")
+        })?;
+        let ann = announcement_id(locked_nft.coin.coin_id(), CLAWBACK_BIND_NONCE);
+        let primary = Conditions::new().assert_coin_announcement(ann);
+        spend_selection(
+            ctx,
+            creator_layer,
+            selection,
+            primary,
+            change_puzzle_hash,
+            fee,
+        )?;
+    }
+
+    Ok(ClawbackOutcome { nft })
 }

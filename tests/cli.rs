@@ -53,6 +53,19 @@ fn option_show_all_help_exposes_history_and_cached_flags() {
 }
 
 #[test]
+fn option_clawback_help_documents_creator_only_expiry_flow() {
+    Command::cargo_bin("pringle")
+        .unwrap()
+        .args(["option", "clawback", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--launcher"))
+        .stdout(predicate::str::contains("--address"))
+        .stdout(predicate::str::contains("--fee"))
+        .stdout(predicate::str::contains("expired"));
+}
+
+#[test]
 fn init_creates_key_and_state() {
     let dir = tempdir().unwrap();
     pringle(dir.path())

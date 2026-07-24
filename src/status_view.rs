@@ -20,6 +20,8 @@ pub enum UserState {
     Exercised,
     /// The option's exercise deadline has passed.
     Expired,
+    /// The option expired and its creator has reclaimed the underlying NFT (clawback).
+    Reclaimed,
     /// The singleton/coin is closed (spent/melted) and no longer live.
     Closed,
     /// The asset moved to a different owner (no longer this wallet).
@@ -39,6 +41,7 @@ impl UserState {
             UserState::LockedInOption => "Locked in option",
             UserState::Exercised => "Exercised",
             UserState::Expired => "Expired",
+            UserState::Reclaimed => "Expired (NFT reclaimed)",
             UserState::Closed => "Closed",
             UserState::Transferred => "Transferred",
             UserState::Empty => "Empty",
@@ -54,6 +57,7 @@ impl UserState {
             UserState::LockedInOption => "locked_in_option",
             UserState::Exercised => "exercised",
             UserState::Expired => "expired",
+            UserState::Reclaimed => "reclaimed",
             UserState::Closed => "closed",
             UserState::Transferred => "transferred",
             UserState::Empty => "empty",
@@ -90,16 +94,23 @@ pub fn nft_state(phase: Phase, chain: &ChainStatus, controlled: bool) -> UserSta
 }
 
 /// Derives the user state of an option from its phase, chain status, expiration, and owner.
+///
+/// `reclaimed` is true once the creator has clawed back the (expired) underlying NFT; since
+/// clawback never melts the option singleton, this is what distinguishes a reclaimed option
+/// from one merely waiting for clawback.
 pub fn option_state(
     phase: Phase,
     chain: &ChainStatus,
     controlled: bool,
     expired: bool,
+    reclaimed: bool,
 ) -> UserState {
     match chain {
         ChainStatus::LookupFailed { .. } => UserState::Unknown,
         ChainStatus::ConfirmedUnspent { .. } => {
-            if expired {
+            if reclaimed {
+                UserState::Reclaimed
+            } else if expired {
                 UserState::Expired
             } else if controlled {
                 UserState::Ready
@@ -110,6 +121,8 @@ pub fn option_state(
         ChainStatus::NotFound => {
             if phase == Phase::Pending {
                 UserState::PendingConfirmation
+            } else if reclaimed {
+                UserState::Reclaimed
             } else if expired {
                 UserState::Expired
             } else {
@@ -180,7 +193,7 @@ mod tests {
 
     #[test]
     fn option_pending_when_not_found_and_pending() {
-        let s = option_state(Phase::Pending, &ChainStatus::NotFound, true, false);
+        let s = option_state(Phase::Pending, &ChainStatus::NotFound, true, false, false);
         assert_eq!(s, UserState::PendingConfirmation);
     }
 
@@ -193,9 +206,25 @@ mod tests {
             },
             true,
             true,
+            false,
         );
         assert_eq!(s, UserState::Expired);
         assert_eq!(s.machine(), "expired");
+    }
+
+    #[test]
+    fn reclaimed_option_reports_reclaimed() {
+        let s = option_state(
+            Phase::Confirmed,
+            &ChainStatus::ConfirmedUnspent {
+                confirmed_height: 10,
+            },
+            true,
+            true,
+            true,
+        );
+        assert_eq!(s, UserState::Reclaimed);
+        assert_eq!(s.machine(), "reclaimed");
     }
 
     #[test]

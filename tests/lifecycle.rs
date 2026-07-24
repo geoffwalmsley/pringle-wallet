@@ -367,6 +367,214 @@ fn option_exercise_returns_nft() -> Result<()> {
 }
 
 #[test]
+fn option_clawback_reclaims_expired_nft() -> Result<()> {
+    // A creator can reclaim the underlying NFT of an expired option: the clawback fails
+    // before the deadline, succeeds after it, recreates the NFT under the creator, and leaves
+    // the option singleton untouched. Afterwards the reclaimed NFT can sweep its p2-singleton.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let alice = sim.bls(1_000_000);
+    let layer = StandardLayer::new(alice.pk);
+    let wallet_ph = alice.puzzle_hash;
+
+    // ---- Mint the NFT and create an option (alice is creator + owner). ----
+    let mint_selection = select_for(vec![alice.coin], nft::NFT_MINT_OUTPUT_VALUE, 0)?;
+    let metadata = NftMetadata::default();
+    let minted = nft::build_mint(ctx, &layer, wallet_ph, &mint_selection, &metadata, 0, 0)?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+    let launcher_id = minted.info.launcher_id;
+    let after_mint = change_coin(alice.coin, wallet_ph, mint_selection.change);
+
+    // Fund the p2-singleton so we can sweep it after reclaiming the NFT.
+    let fund = select_for(vec![after_mint], 100_000, 0)?;
+    let p2_coin = p2_singleton::build_fund(ctx, &layer, launcher_id, 100_000, &fund, wallet_ph, 0)?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+    let after_fund = change_coin(after_mint, wallet_ph, fund.change);
+
+    let option_selection = select_for(vec![after_fund], option::OPTION_OUTPUT_VALUE, 0)?;
+    let strike = 1_000u64;
+    let expiration = 2_000u64;
+    let outcome = option::build_create(
+        ctx,
+        &layer,
+        minted,
+        &option_selection,
+        strike,
+        expiration,
+        wallet_ph, // creator
+        wallet_ph, // owner
+        wallet_ph, // change
+        0,
+    )?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+    assert!(sim.coin_state(outcome.option.coin.coin_id()).is_some());
+
+    // ---- Clawback before expiry must be rejected on-chain. ----
+    {
+        let early = option::build_clawback(
+            ctx,
+            &layer,
+            outcome.launcher_id,
+            outcome.locked_nft,
+            wallet_ph,
+            expiration,
+            strike,
+            wallet_ph,
+            None,
+            wallet_ph,
+            0,
+        )?;
+        // Keep it well before the deadline.
+        sim.set_next_timestamp(expiration - 500)?;
+        let result = sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk));
+        assert!(
+            result.is_err(),
+            "clawback must not succeed before the option's expiration deadline"
+        );
+        let _ = early;
+    }
+
+    // The locked NFT must still be unspent after the rejected early clawback.
+    assert!(sim
+        .coin_state(outcome.locked_nft.coin.coin_id())
+        .expect("locked nft exists")
+        .spent_height
+        .is_none());
+
+    // ---- Clawback after expiry succeeds. ----
+    sim.set_next_timestamp(expiration + 1)?;
+    let clawback = option::build_clawback(
+        ctx,
+        &layer,
+        outcome.launcher_id,
+        outcome.locked_nft,
+        wallet_ph,
+        expiration,
+        strike,
+        wallet_ph,
+        None,
+        wallet_ph,
+        0,
+    )?;
+    assert_eq!(clawback.nft.info.p2_puzzle_hash, wallet_ph);
+    assert_eq!(clawback.nft.info.launcher_id, launcher_id);
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+    // The locked NFT coin was consumed and the reclaimed NFT is live under alice.
+    assert!(sim
+        .coin_state(outcome.locked_nft.coin.coin_id())
+        .expect("locked nft coin exists")
+        .spent_height
+        .is_some());
+    let reclaimed = sim
+        .coin_state(clawback.nft.coin.coin_id())
+        .expect("reclaimed nft coin exists");
+    assert!(reclaimed.spent_height.is_none());
+    assert_eq!(reclaimed.coin.puzzle_hash, clawback.nft.coin.puzzle_hash);
+
+    // The option singleton is untouched: clawback only spends the underlying.
+    assert!(sim
+        .coin_state(outcome.option.coin.coin_id())
+        .expect("option coin exists")
+        .spent_height
+        .is_none());
+
+    // ---- The reclaimed NFT can now sweep the accumulated p2-singleton income. ----
+    let sweep = p2_singleton::build_sweep(
+        ctx,
+        &layer,
+        clawback.nft,
+        launcher_id,
+        &[p2_coin],
+        wallet_ph,
+        0,
+    )?;
+    assert_eq!(sweep.total, 100_000);
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+    assert_eq!(
+        sim.coin_state(sweep.swept_coin.coin_id())
+            .expect("payout exists")
+            .coin
+            .amount,
+        100_000
+    );
+
+    Ok(())
+}
+
+#[test]
+fn option_clawback_with_fee_pays_from_separate_coins() -> Result<()> {
+    // A clawback fee is funded from separate regular-XCH inputs bound to the NFT spend.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let alice = sim.bls(1_000_000);
+    let layer = StandardLayer::new(alice.pk);
+    let wallet_ph = alice.puzzle_hash;
+
+    let mint_selection = select_for(vec![alice.coin], nft::NFT_MINT_OUTPUT_VALUE, 0)?;
+    let metadata = NftMetadata::default();
+    let minted = nft::build_mint(ctx, &layer, wallet_ph, &mint_selection, &metadata, 0, 0)?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+    let after_mint = change_coin(alice.coin, wallet_ph, mint_selection.change);
+
+    let option_selection = select_for(vec![after_mint], option::OPTION_OUTPUT_VALUE, 0)?;
+    let strike = 1_000u64;
+    let expiration = 2_000u64;
+    let outcome = option::build_create(
+        ctx,
+        &layer,
+        minted,
+        &option_selection,
+        strike,
+        expiration,
+        wallet_ph,
+        wallet_ph,
+        wallet_ph,
+        0,
+    )?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+    let after_option = change_coin(after_mint, wallet_ph, option_selection.change);
+
+    sim.set_next_timestamp(expiration + 1)?;
+    let fee = 500u64;
+    let fee_selection = select_for(vec![after_option], 0, fee)?;
+    let clawback = option::build_clawback(
+        ctx,
+        &layer,
+        outcome.launcher_id,
+        outcome.locked_nft,
+        wallet_ph,
+        expiration,
+        strike,
+        wallet_ph,
+        Some(&fee_selection),
+        wallet_ph,
+        fee,
+    )?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+    assert_eq!(
+        clawback.nft.info.launcher_id,
+        outcome.locked_nft.info.launcher_id
+    );
+    assert!(sim
+        .coin_state(clawback.nft.coin.coin_id())
+        .expect("reclaimed nft exists")
+        .spent_height
+        .is_none());
+    // The fee input coin was consumed.
+    assert!(sim
+        .coin_state(fee_selection.coins[0].coin_id())
+        .expect("fee coin exists")
+        .spent_height
+        .is_some());
+
+    Ok(())
+}
+
+#[test]
 fn p2_singleton_sweep_moves_full_balance() -> Result<()> {
     let mut sim = Simulator::new();
     let ctx = &mut SpendContext::new();
