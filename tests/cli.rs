@@ -26,19 +26,36 @@ fn help_lists_commands() {
         .success()
         .stdout(predicate::str::contains("Usage"))
         .stdout(predicate::str::contains("xch"))
+        .stdout(predicate::str::contains("nft"))
         .stdout(predicate::str::contains("option"))
-        .stdout(predicate::str::contains("p2-singleton"));
+        .stdout(predicate::str::contains("p2-singleton").not());
 }
 
 #[test]
-fn xch_help_lists_consolidate_and_send_all() {
+fn xch_help_lists_wallet_subcommands() {
     Command::cargo_bin("pringle")
         .unwrap()
         .args(["xch", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("address"))
+        .stdout(predicate::str::contains("coins"))
+        .stdout(predicate::str::contains("coin"))
         .stdout(predicate::str::contains("consolidate"))
         .stdout(predicate::str::contains("send-all"));
+}
+
+#[test]
+fn nft_help_lists_mint_address_and_sweep_without_fund() {
+    Command::cargo_bin("pringle")
+        .unwrap()
+        .args(["nft", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mint"))
+        .stdout(predicate::str::contains("address"))
+        .stdout(predicate::str::contains("sweep"))
+        .stdout(predicate::str::contains("fund").not());
 }
 
 #[test]
@@ -82,7 +99,10 @@ fn address_prints_only_the_address_by_default() {
     let dir = tempdir().unwrap();
     pringle(dir.path()).arg("init").assert().success();
 
-    let out = pringle(dir.path()).arg("address").output().unwrap();
+    let out = pringle(dir.path())
+        .args(["xch", "address"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
@@ -101,7 +121,7 @@ fn address_verbose_includes_puzzle_hash() {
     pringle(dir.path()).arg("init").assert().success();
 
     pringle(dir.path())
-        .arg("address")
+        .args(["xch", "address"])
         .arg("--verbose")
         .assert()
         .success()
@@ -115,7 +135,7 @@ fn address_json_is_a_valid_envelope() {
 
     let out = pringle(dir.path())
         .arg("--json")
-        .arg("address")
+        .args(["xch", "address"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -151,7 +171,7 @@ fn missing_key_gives_a_clear_error() {
     let dir = tempdir().unwrap();
     // No `init`: address should fail with a helpful message and a non-zero exit code.
     pringle(dir.path())
-        .arg("address")
+        .args(["xch", "address"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("no key file"));

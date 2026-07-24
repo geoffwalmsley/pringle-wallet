@@ -28,9 +28,10 @@ controls the income stream, rather than an option on each individual incoming XC
 
 This model was designed mainly for potpotato.xyz revenue streams: route the stream to an
 NFT-controlled p2 singleton, lock that NFT as the option underlying, and trade the option using a
-Chia offer file. Pringle can also fund these addresses directly for testing.
+Chia offer file. Income arrives by sending XCH to the NFT's income address (`pringle nft address`)
+from any wallet.
 
-Creating, funding, offering, taking, exercising, sweeping, and clawback are all implemented.
+Creating, offering, taking, exercising, sweeping, and clawback are all implemented.
 If an option expires unexercised, its creator can reclaim the locked NFT with `pringle option
 clawback` (see [Expired options](#expired-options)); no option "melt" is required.
 
@@ -87,11 +88,11 @@ All amounts are in **mojos** (1 XCH = 1,000,000,000,000 mojos). State is kept in
 ```sh
 # 1. Create a local key (fresh state) and print the wallet address.
 pringle init
-pringle address
+pringle xch address
 
 # 2. Inspect on-chain coins for the wallet.
-pringle coins
-pringle coin <coin-id>
+pringle xch coins
+pringle xch coin <coin-id>
 
 # Combine all spendable regular XCH coins into one wallet coin. To instead empty the
 # regular wallet, send the full spendable balance (minus the fee) to an xch address.
@@ -102,17 +103,17 @@ pringle xch send-all xch1... --fee 100000
 # 3. Mint an NFT owned by the wallet (fee in mojos).
 pringle nft mint --fee 100000
 
-# 4. Derive and fund the NFT's p2 singleton (the NFT must be confirmed first).
-pringle p2-singleton address
-pringle p2-singleton fund --amount 1000000000 --fee 100000
+# 4. Derive the NFT's income address (the NFT must be confirmed first). Send XCH to this
+# address from any wallet to accumulate income under the NFT's control.
+pringle nft address
 
-# Later: sweep the entire p2 singleton balance (all coins) out in one transaction.
+# Later: sweep the NFT's entire accumulated income (all coins) out in one transaction.
 # Defaults to the wallet's own address; pass --address to send elsewhere. The NFT is
 # co-spent to authorize the sweep, so it must be wallet-controlled (not locked in an option).
 # Because the singleton layer requires exactly one odd output (the recreated NFT), an odd
 # remaining mojo is unavoidably donated to the fee; the sweep reports it separately.
-pringle p2-singleton sweep --fee 100000
-pringle p2-singleton sweep --address xch1... --fee 100000
+pringle nft sweep --fee 100000
+pringle nft sweep --address xch1... --fee 100000
 
 # 5. Create an NFT-backed XCH option.
 pringle option create --strike 5000000000000 --expiration 1893456000 --fee 100000
@@ -161,7 +162,7 @@ Reclaiming is a two-step, creator-only flow:
 1. `pringle option clawback` — spends the locked NFT through its clawback path (which enforces the
    expiry deadline with `ASSERT_SECONDS_ABSOLUTE` and requires the creator's key) and recreates
    the NFT under your control. Any fee is funded from separate regular-XCH coins.
-2. After `pringle status` shows the NFT as *Ready*, run `pringle p2-singleton sweep` to withdraw
+2. After `pringle status` shows the NFT as *Ready*, run `pringle nft sweep` to withdraw
    the income the NFT's p2 singleton accumulated while the option was live.
 
 `pringle status` and `pringle option show-all --include-closed` flag eligible options with a

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-/// A simple mainnet Chia CLI: keys, NFTs, p2 singleton funding, and NFT-backed options.
+/// A simple mainnet Chia CLI: keys, XCH, NFTs, and NFT-backed options.
 ///
 /// All amounts are in mojos (1 XCH = 1_000_000_000_000 mojos). This wallet operates on
 /// mainnet and submits real transactions; destructive commands preview the action and (in
@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 ///   pringle init
 ///   pringle nft mint
 ///   pringle status                 # refreshes against the chain
-///   pringle p2-singleton fund --amount 1000000000
+///   pringle nft address            # income address controlled by the NFT
 ///   pringle option create --strike 5000000000000 --expiration <unix>
 ///   pringle option offer --request 250000000 -o my.offer
 #[derive(Debug, Parser)]
@@ -52,15 +52,6 @@ pub struct Cli {
 pub enum Command {
     /// Generate a new local key and initialize fresh state.
     Init,
-    /// Print the wallet's mainnet address.
-    Address,
-    /// List confirmed, unspent coins owned by the wallet.
-    Coins,
-    /// Show details for a specific coin id.
-    Coin {
-        /// The coin id (hex, with or without `0x`).
-        coin_id: String,
-    },
     /// Regular XCH wallet operations.
     Xch {
         #[command(subcommand)]
@@ -70,12 +61,6 @@ pub enum Command {
     Nft {
         #[command(subcommand)]
         command: NftCommand,
-    },
-    /// p2 singleton operations (funds controlled by an NFT).
-    #[command(name = "p2-singleton")]
-    P2Singleton {
-        #[command(subcommand)]
-        command: P2SingletonCommand,
     },
     /// Option contract operations.
     Option {
@@ -95,6 +80,15 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum XchCommand {
+    /// Print the wallet's mainnet address.
+    Address,
+    /// List confirmed, unspent coins owned by the wallet.
+    Coins,
+    /// Show details for a specific coin id.
+    Coin {
+        /// The coin id (hex, with or without `0x`).
+        coin_id: String,
+    },
     /// Combine every spendable standard-wallet XCH coin into one coin.
     Consolidate {
         /// Transaction fee in mojos (deducted from the consolidated output).
@@ -128,29 +122,13 @@ pub enum NftCommand {
         #[arg(long)]
         data_hash: Option<String>,
     },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum P2SingletonCommand {
-    /// Print the p2 singleton address controlled by the NFT.
+    /// Print the income address controlled by the NFT (its p2 singleton).
     Address {
         /// Which NFT to use, by launcher id (required only when several are tracked).
         #[arg(long)]
         launcher: Option<String>,
     },
-    /// Fund the p2 singleton with XCH from the wallet.
-    Fund {
-        /// Amount to fund, in mojos.
-        #[arg(long)]
-        amount: u64,
-        /// Transaction fee in mojos.
-        #[arg(long, default_value_t = 0)]
-        fee: u64,
-        /// Which NFT to fund, by launcher id (required only when several are tracked).
-        #[arg(long)]
-        launcher: Option<String>,
-    },
-    /// Sweep the entire p2 singleton balance (all coins) to an address in one transaction.
+    /// Sweep the NFT's entire accumulated income (all coins) to an address in one transaction.
     Sweep {
         /// Destination address (defaults to the wallet's own address).
         #[arg(long)]
@@ -158,7 +136,7 @@ pub enum P2SingletonCommand {
         /// Transaction fee in mojos (taken out of the swept balance).
         #[arg(long, default_value_t = 0)]
         fee: u64,
-        /// Which NFT's p2 singleton to sweep, by launcher id (required only when several
+        /// Which NFT's income to sweep, by launcher id (required only when several
         /// are tracked).
         #[arg(long)]
         launcher: Option<String>,
@@ -240,7 +218,7 @@ pub enum OptionCommand {
     /// Reclaim the underlying NFT of an expired option you created (creator-only clawback).
     ///
     /// Only works after the option's expiration deadline has passed. The expired option coin
-    /// is left untouched; once the reclaimed NFT confirms, use `p2-singleton sweep` to
+    /// is left untouched; once the reclaimed NFT confirms, use `nft sweep` to
     /// withdraw its accumulated income.
     Clawback {
         /// Destination address for the reclaimed NFT owner (defaults to the wallet address).

@@ -21,14 +21,14 @@ use pringle_wallet::output::{self, AppError, Report};
 use pringle_wallet::p2_singleton;
 use pringle_wallet::signing::sign_spend_bundle;
 use pringle_wallet::state::{
-    from_hex, to_hex, CoinJson, OptionRecord, P2SingletonRecord, Phase, ProofJson, State, TxRecord,
+    from_hex, to_hex, CoinJson, OptionRecord, Phase, ProofJson, State, TxRecord,
 };
 use pringle_wallet::status_view;
 use pringle_wallet::sync;
 use pringle_wallet::wallet::{select_for, spend_all, Selection};
 use pringle_wallet::MAINNET_PREFIX;
 
-use cli::{Cli, Command, NftCommand, OptionCommand, P2SingletonCommand, XchCommand};
+use cli::{Cli, Command, NftCommand, OptionCommand, XchCommand};
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -53,10 +53,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Init => cmd_init(&key_file, &state_file),
-        Command::Address => cmd_address(&key_file, &state_file),
-        Command::Coins => cmd_coins(&key_file).await,
-        Command::Coin { coin_id } => cmd_coin(&coin_id).await,
         Command::Xch { command } => match command {
+            XchCommand::Address => cmd_address(&key_file, &state_file),
+            XchCommand::Coins => cmd_coins(&key_file).await,
+            XchCommand::Coin { coin_id } => cmd_coin(&coin_id).await,
             XchCommand::Consolidate { fee } => {
                 cmd_xch_spend_all(&key_file, &state_file, None, fee, yes).await
             }
@@ -82,32 +82,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 )
                 .await
             }
-        },
-        Command::P2Singleton { command } => match command {
-            P2SingletonCommand::Address { launcher } => {
-                cmd_p2_singleton_address(&state_file, launcher.as_deref())
-            }
-            P2SingletonCommand::Fund {
-                amount,
-                fee,
-                launcher,
-            } => {
-                cmd_p2_singleton_fund(
-                    &key_file,
-                    &state_file,
-                    amount,
-                    fee,
-                    launcher.as_deref(),
-                    yes,
-                )
-                .await
-            }
-            P2SingletonCommand::Sweep {
+            NftCommand::Address { launcher } => cmd_nft_address(&state_file, launcher.as_deref()),
+            NftCommand::Sweep {
                 address,
                 fee,
                 launcher,
             } => {
-                cmd_p2_singleton_sweep(
+                cmd_nft_sweep(
                     &key_file,
                     &state_file,
                     address,
@@ -413,7 +394,7 @@ async fn cmd_xch_spend_all(
         return Err(
             AppError::recoverable("wallet already has one spendable XCH coin")
                 .why("there is nothing to consolidate")
-                .next("use `pringle coins` to inspect the wallet balance")
+                .next("use `pringle xch coins` to inspect the wallet balance")
                 .into(),
         );
     }
@@ -636,21 +617,21 @@ async fn cmd_nft_mint(
         .field("Launcher id", to_hex(minted.info.launcher_id), "launcher_id")
         .primary()
         .field("NFT coin id", to_hex(minted.coin.coin_id()), "nft_coin_id")
-        .note("Submitted, not yet confirmed. Run `pringle status` and wait before funding the p2 singleton.");
+        .note("Submitted, not yet confirmed. Run `pringle status` to watch it settle, then `pringle nft address` for its income address.");
     report.emit();
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// p2 singleton
+// NFT income (p2 singleton)
 // ---------------------------------------------------------------------------
 
-fn cmd_p2_singleton_address(state_file: &Path, launcher: Option<&str>) -> Result<()> {
+fn cmd_nft_address(state_file: &Path, launcher: Option<&str>) -> Result<()> {
     let state = State::load(state_file)?;
     let nft = state.select_nft(launcher)?;
     let launcher_id = from_hex(&nft.launcher_id)?;
 
-    let mut report = Report::new("p2_singleton_address", "p2 singleton address");
+    let mut report = Report::new("p2_singleton_address", "NFT income address");
     report
         .field("Controlling NFT", &nft.launcher_id, "nft_launcher_id")
         .field("Address", p2_singleton::address(launcher_id)?, "address")
@@ -666,95 +647,7 @@ fn cmd_p2_singleton_address(state_file: &Path, launcher: Option<&str>) -> Result
     Ok(())
 }
 
-async fn cmd_p2_singleton_fund(
-    key_file: &Path,
-    state_file: &Path,
-    amount: u64,
-    fee: u64,
-    launcher: Option<&str>,
-    assume_yes: bool,
-) -> Result<()> {
-    if amount == 0 {
-        return Err(AppError::recoverable("--amount must be greater than zero").into());
-    }
-
-    let wallet = load_wallet(key_file)?;
-    let mut state = State::load(state_file)?;
-    let nft_record = state.select_nft(launcher)?;
-    let launcher_id = from_hex(&nft_record.launcher_id)?;
-
-    let coinset = Coinset::mainnet();
-
-    // The NFT must be confirmed before we fund a p2 singleton it will control.
-    require_confirmed_unspent(&coinset, nft_record.coin.to_coin()?.coin_id(), "NFT").await?;
-
-    let coins = wallet_spendable_coins(&coinset, &wallet, &state).await?;
-    let selection = select_for(coins, amount, fee)?;
-
-    let address = p2_singleton::address(launcher_id)?;
-    let preview = ActionPreview::new("Fund p2 singleton")
-        .detail("Amount", format::xch(amount))
-        .detail("Fee", format::xch(fee))
-        .detail("Destination", &address)
-        .detail("Controlling NFT", &nft_record.launcher_id);
-    if !confirm_or_abort(&preview, assume_yes)? {
-        return Ok(());
-    }
-
-    let mut ctx = SpendContext::new();
-    let funded = p2_singleton::build_fund(
-        &mut ctx,
-        &wallet.standard_layer(),
-        launcher_id,
-        amount,
-        &selection,
-        wallet.puzzle_hash(),
-        fee,
-    )?;
-
-    let bundle = sign_spend_bundle(ctx.take(), &[wallet.synthetic_secret_key().clone()])?;
-    coinset.push_tx(bundle).await?;
-
-    state.transactions.push(TxRecord::new(
-        "p2_singleton_fund",
-        selection_spent_ids(&selection),
-        to_hex(funded.coin_id()),
-    ));
-
-    let puzzle_hash = to_hex(p2_singleton::puzzle_hash(launcher_id));
-    match state.p2_mut(&nft_record.launcher_id) {
-        Some(record) => {
-            record.funded_coins.push(CoinJson::from_coin(funded));
-            record.phase = Phase::Pending;
-        }
-        None => {
-            state.upsert_p2_singleton(P2SingletonRecord {
-                launcher_id: to_hex(launcher_id),
-                puzzle_hash,
-                address: address.clone(),
-                funded_coins: vec![CoinJson::from_coin(funded)],
-                phase: Phase::Pending,
-            });
-        }
-    }
-    state.save(state_file)?;
-
-    let mut report = Report::new("p2_singleton_fund", "Submitted p2 singleton funding.");
-    report
-        .field_json(
-            "Amount",
-            format::xch(amount),
-            "amount_mojos",
-            Value::from(amount),
-        )
-        .field("Funded coin id", to_hex(funded.coin_id()), "funded_coin_id")
-        .primary()
-        .note("Submitted, not yet confirmed. Run `pringle status` to watch it settle.");
-    report.emit();
-    Ok(())
-}
-
-async fn cmd_p2_singleton_sweep(
+async fn cmd_nft_sweep(
     key_file: &Path,
     state_file: &Path,
     address: Option<String>,
@@ -770,8 +663,9 @@ async fn cmd_p2_singleton_sweep(
         .p2_by_launcher(&nft_record.launcher_id)
         .cloned()
         .ok_or_else(|| {
-            AppError::recoverable("no p2 singleton tracked for this NFT")
-                .next("run `pringle p2-singleton fund` first")
+            AppError::recoverable("no income tracked for this NFT")
+                .why("no XCH has been sent to the NFT's income address, or state is behind the chain")
+                .next("send XCH to `pringle nft address`, then run `pringle sync`")
         })?;
     let launcher_id = from_hex(&nft_record.launcher_id)?;
 
@@ -1863,7 +1757,7 @@ async fn cmd_option_clawback(
         .field("NFT owner", reclaim_label, "reclaim_address")
         .note(
             "Submitted, not yet confirmed. Once `pringle status` shows the NFT as Ready, run\n\
-             `pringle p2-singleton sweep` to withdraw its accumulated income.",
+             `pringle nft sweep` to withdraw its accumulated income.",
         );
     report.emit();
     Ok(())

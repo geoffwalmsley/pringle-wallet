@@ -2,7 +2,7 @@
 name = "pringle-wallet"
 version = "0.1.0"
 edition = "2021"
-description = "A simple mainnet Chia CLI for keys, NFTs, p2_singleton funding, and NFT-backed options."
+description = "A simple mainnet Chia CLI for keys, XCH, NFTs, and NFT-backed options."
 license = "MIT"
 
 [lib]
