@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 
 # Local wallet material and CLI state (contains an unencrypted private key).
 pringle-key*
