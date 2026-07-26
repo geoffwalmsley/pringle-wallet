@@ -180,9 +180,22 @@ impl Coinset {
         if !record.spent {
             return Ok(None);
         }
+        self.coin_spend_at(coin_id, record.spent_block_index).await
+    }
+
+    /// Fetches the spend of a coin whose spent height is already known.
+    ///
+    /// Prefer this over [`Coinset::coin_spend`] when the height is already in hand: it
+    /// saves a lookup, and coinset takes tens of seconds to answer without a height
+    /// because it has to go looking for the spend.
+    pub async fn coin_spend_at(
+        &self,
+        coin_id: Bytes32,
+        spent_height: u32,
+    ) -> Result<Option<CoinSpend>> {
         let response = self
             .client
-            .get_puzzle_and_solution(coin_id, Some(record.spent_block_index))
+            .get_puzzle_and_solution(coin_id, Some(spent_height))
             .await?;
         if !response.success {
             bail!(

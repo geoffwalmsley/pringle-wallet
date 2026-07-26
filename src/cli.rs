@@ -67,6 +67,19 @@ pub enum Command {
         #[command(subcommand)]
         command: OptionCommand,
     },
+    /// Show the Pot Potato game: the pot, who holds it, and the most recent holders.
+    ///
+    /// The potato is a coin lineage with no fixed puzzle hash, so it has to be followed
+    /// hop by hop. The newest coin found is cached in the state file, which keeps repeat
+    /// runs to a single lookup.
+    Potato {
+        /// How many previous holders to list.
+        #[arg(long, default_value_t = 5)]
+        holders: usize,
+        /// Follow the lineage from this potato coin id instead of the cached anchor.
+        #[arg(long)]
+        coin: Option<String>,
+    },
     /// Show the local lifecycle state, refreshed against the chain by default.
     Status {
         /// Show the local snapshot without contacting the network.

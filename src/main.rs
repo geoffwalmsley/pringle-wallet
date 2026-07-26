@@ -19,9 +19,10 @@ use pringle_wallet::nft;
 use pringle_wallet::option as option_contract;
 use pringle_wallet::output::{self, AppError, Report};
 use pringle_wallet::p2_singleton;
+use pringle_wallet::potato;
 use pringle_wallet::signing::sign_spend_bundle;
 use pringle_wallet::state::{
-    from_hex, to_hex, CoinJson, OptionRecord, Phase, ProofJson, State, TxRecord,
+    from_hex, to_hex, CoinJson, OptionRecord, Phase, PotatoCache, ProofJson, State, TxRecord,
 };
 use pringle_wallet::status_view;
 use pringle_wallet::sync;
@@ -166,6 +167,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 .await
             }
         },
+        Command::Potato { holders, coin } => {
+            cmd_potato(&state_file, holders, coin.as_deref()).await
+        }
         Command::Status { cached } => cmd_status(&key_file, &state_file, cached).await,
         Command::Sync => cmd_sync(&key_file, &state_file).await,
     }
@@ -551,6 +555,185 @@ async fn cmd_coin(coin_id: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pot Potato
+// ---------------------------------------------------------------------------
+
+/// Keeps the cached lineage from growing without bound, while still covering whatever
+/// depth of history the caller asked for.
+fn potato_cache_limit(holders: usize) -> usize {
+    100.max(holders + 1)
+}
+
+async fn cmd_potato(state_file: &Path, holders: usize, coin: Option<&str>) -> Result<()> {
+    let mut state = State::load(state_file)?;
+    let cached: Vec<potato::Hold> = state
+        .potato
+        .iter()
+        .flat_map(|cache| cache.holds.iter())
+        .map(potato::Hold::from_json)
+        .collect::<Result<_>>()?;
+
+    // An explicit --coin re-anchors the walk, so history cached for the old anchor no
+    // longer applies.
+    let (anchor, cached) = match coin {
+        Some(id) => (from_hex(id)?, Vec::new()),
+        None => match cached.first() {
+            Some(newest) => (newest.coin.coin_id(), cached),
+            None => (from_hex(potato::DEFAULT_ANCHOR)?, Vec::new()),
+        },
+    };
+
+    output::progress("Following the potato on-chain...");
+    let coinset = Coinset::mainnet();
+    let game = potato::refresh(&coinset, anchor, cached, holders).await?;
+
+    let Some(current) = game.latest() else {
+        return Err(AppError::chain("no potato holder could be resolved")
+            .why("the lineage walk produced no holders")
+            .next("re-anchor with `pringle potato --coin <potato coin id>`")
+            .into());
+    };
+
+    // Only the default lineage is worth remembering; an ad-hoc --coin walk may be an
+    // entirely different round.
+    if coin.is_none() {
+        let mut holds: Vec<_> = game.holds.iter().map(potato::Hold::to_json).collect();
+        holds.truncate(potato_cache_limit(holders));
+        state.potato = Some(PotatoCache { holds });
+        state.save(state_file)?;
+    }
+
+    let now = now_seconds();
+    let pot = game.pot();
+    let held_for = current.held_for(now);
+
+    let title = match &game.claim {
+        Some(_) => format!("Pot Potato — pot claimed, {} XCH", format::xch_only(pot)),
+        None => format!("Pot Potato — {} XCH in the pot", format::xch_only(pot)),
+    };
+    let mut report = Report::new("potato", title);
+    report
+        .field_json("Pot", format::xch(pot), "pot_mojos", Value::from(pot))
+        .primary()
+        .field(
+            "Coin",
+            display_id(to_hex(current.coin.coin_id())),
+            "coin_id",
+        )
+        .field("Holder", display_address(&current.address()?), "holder")
+        .json_only("holder_puzzle_hash", Value::from(to_hex(current.holder)))
+        .field_json(
+            "Took it",
+            format::utc_datetime(current.acquired_at),
+            "acquired_at",
+            Value::from(current.acquired_at),
+        )
+        .field_json(
+            "Held for",
+            format::duration(held_for),
+            "held_seconds",
+            Value::from(held_for),
+        );
+
+    match &game.claim {
+        Some(claim) => {
+            report
+                .field_json(
+                    "Claimed",
+                    claim
+                        .claimed_at
+                        .map_or_else(|| "yes".to_string(), format::utc_datetime),
+                    "claimed_at",
+                    claim.claimed_at.map_or(Value::Null, Value::from),
+                )
+                .json_only("claimed", Value::Bool(true));
+        }
+        None => {
+            report
+                .field_json(
+                    "Claimable",
+                    claimable_at(current.deadline(), now),
+                    "deadline",
+                    Value::from(current.deadline()),
+                )
+                .json_only("claimed", Value::Bool(false));
+        }
+    }
+
+    // The cache can hold more history than was asked for, so trim to the requested depth.
+    let previous = game.holds.get(1..).unwrap_or_default();
+    let previous = &previous[..previous.len().min(holders)];
+    report.json_only(
+        "previous_holders",
+        Value::Array(
+            previous
+                .iter()
+                .map(|hold| {
+                    json!({
+                        "coin_id": to_hex(hold.coin.coin_id()),
+                        "pot_mojos": hold.coin.amount,
+                        "holder": hold.address().unwrap_or_default(),
+                        "holder_puzzle_hash": to_hex(hold.holder),
+                        "acquired_at": hold.acquired_at,
+                        "sold_at": hold.sold_at,
+                        "held_seconds": hold.held_for(now),
+                    })
+                })
+                .collect(),
+        ),
+    );
+
+    if previous.is_empty() {
+        report.note("No earlier holders found; this is the start of the lineage.");
+    } else {
+        report.note(previous_holders_table(previous, now)?);
+    }
+
+    report.emit();
+    Ok(())
+}
+
+/// Renders the deadline plus how far away it is, in either direction.
+fn claimable_at(deadline: u64, now: u64) -> String {
+    let when = format::utc_datetime(deadline);
+    if deadline > now {
+        format!("{when} (in {})", format::duration(deadline - now))
+    } else {
+        format!(
+            "{when} (claimable now, {} ago)",
+            format::duration(now - deadline)
+        )
+    }
+}
+
+/// Renders previous holders as an aligned block, newest first.
+fn previous_holders_table(holds: &[potato::Hold], now: u64) -> Result<String> {
+    let mut out = format!(
+        "Last {} holder{}",
+        holds.len(),
+        if holds.len() == 1 { "" } else { "s" }
+    );
+    for hold in holds {
+        out.push_str(&format!(
+            "\n  {:>8}  {}  held {:<8}  {}",
+            format!("{} XCH", format::xch_only(hold.coin.amount)),
+            format::utc_datetime(hold.acquired_at),
+            format::duration(hold.held_for(now)),
+            display_address(&hold.address()?),
+        ));
+    }
+    Ok(out)
+}
+
+/// Abbreviates an address for human output, keeping it exact for verbose and JSON.
+fn display_address(address: &str) -> String {
+    if output::is_verbose() || output::is_json() || address.len() <= 20 {
+        return address.to_string();
+    }
+    format!("{}…{}", &address[..10], &address[address.len() - 6..])
 }
 
 // ---------------------------------------------------------------------------
@@ -1989,7 +2172,8 @@ fn clawback_eligible(option: &OptionRecord, wallet_ph: Option<Bytes32>, now: u64
 
 /// Abbreviates an id for human display unless verbose mode is on.
 fn display_id(id: String) -> String {
-    if output::is_verbose() {
+    // Abbreviation is a human-reading convenience; JSON consumers need the exact id.
+    if output::is_verbose() || output::is_json() {
         id
     } else {
         format::abbrev(&id)

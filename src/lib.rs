@@ -15,6 +15,7 @@ pub mod nft;
 pub mod option;
 pub mod output;
 pub mod p2_singleton;
+pub mod potato;
 pub mod signing;
 pub mod state;
 pub mod status_view;

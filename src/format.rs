@@ -97,6 +97,32 @@ pub fn relative_time(target: u64, now: u64) -> String {
     }
 }
 
+/// Renders a duration with up to two units, e.g. `2d 3h`, `4h 32m`, `51m 12s`, `9s`.
+///
+/// Unlike [`relative_time`]'s coarse single unit, this keeps enough resolution to compare
+/// durations that differ by minutes.
+pub fn duration(seconds: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    let (major, major_unit, minor, minor_unit) = if seconds >= DAY {
+        (seconds / DAY, 'd', (seconds % DAY) / HOUR, 'h')
+    } else if seconds >= HOUR {
+        (seconds / HOUR, 'h', (seconds % HOUR) / MINUTE, 'm')
+    } else if seconds >= MINUTE {
+        (seconds / MINUTE, 'm', seconds % MINUTE, 's')
+    } else {
+        return format!("{seconds}s");
+    };
+
+    if minor == 0 {
+        format!("{major}{major_unit}")
+    } else {
+        format!("{major}{major_unit} {minor}{minor_unit}")
+    }
+}
+
 fn humanize_duration(seconds: u64) -> String {
     const MINUTE: u64 = 60;
     const HOUR: u64 = 60 * MINUTE;
@@ -148,6 +174,17 @@ mod tests {
         let id = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert_eq!(abbrev(id), "0x012345…cdef");
         assert_eq!(abbrev("0xabcd"), "0xabcd");
+    }
+
+    #[test]
+    fn duration_uses_at_most_two_units() {
+        assert_eq!(duration(9), "9s");
+        assert_eq!(duration(60), "1m");
+        assert_eq!(duration(3072), "51m 12s");
+        assert_eq!(duration(16_320), "4h 32m");
+        assert_eq!(duration(7_200), "2h");
+        assert_eq!(duration(97_200), "1d 3h");
+        assert_eq!(duration(86_400), "1d");
     }
 
     #[test]

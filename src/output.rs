@@ -327,7 +327,9 @@ impl Report {
             }
             Mode::Human => {
                 println!("{}", self.title);
-                let width = self.lines.iter().map(|l| l.label.len()).max().unwrap_or(0);
+                // Labels are printed with a trailing colon, so the column has to be one
+                // wider than the longest label or that label overflows it.
+                let width = self.lines.iter().map(|l| l.label.len()).max().unwrap_or(0) + 1;
                 for line in &self.lines {
                     println!("  {:<width$}  {}", format!("{}:", line.label), line.value);
                 }
