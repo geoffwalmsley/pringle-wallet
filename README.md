@@ -21,10 +21,13 @@ The NFT acts as the control key for its deterministic `p2 singleton` address. In
 arriving at that address while the NFT is locked in an option. Those coins cannot be swept without
 co-spending the NFT, so the option writer cannot withdraw them while the NFT remains locked.
 
-The option holder can exercise before expiration by paying the XCH strike. Exercise transfers the
-NFT and therefore control of the accumulated p2-singleton balance—and any future income sent to
-the same address—to the exerciser. The traded option coin is therefore an option on the NFT that
-controls the income stream, rather than an option on each individual incoming XCH coin.
+The option holder can exercise before expiration by paying the XCH strike. There are two option
+**kinds**, chosen at creation, that differ only in what exercise does (see
+[Option kinds](#option-kinds)). The default `transfer` kind hands the NFT—and therefore control of
+the accumulated p2-singleton balance and any future income sent to the same address—to the
+exerciser. The `sweep` kind instead pays the holder only the income accumulated at the moment of
+exercise and returns the NFT to the creator. Either way, the traded option coin is an option on the
+income stream controlled by the NFT, rather than an option on each individual incoming XCH coin.
 
 This model was designed mainly for potpotato.xyz revenue streams: route the stream to an
 NFT-controlled p2 singleton, lock that NFT as the option underlying, and trade the option using a
@@ -34,6 +37,46 @@ from any wallet.
 Creating, offering, taking, exercising, sweeping, and clawback are all implemented.
 If an option expires unexercised, its creator can reclaim the locked NFT with `pringle option
 clawback` (see [Expired options](#expired-options)); no option "melt" is required.
+
+## Option kinds
+
+Every option is one of two kinds, fixed at creation with `pringle option create --kind`:
+
+- **`transfer`** (default) — exercise pays the strike and hands the NFT to the holder, along with
+  control of the p2-singleton address: the balance sitting there now *and* every future coin sent
+  to it. It is a call on the income stream itself.
+- **`sweep`** — exercise pays the same strike but sweeps only the income accumulated at that moment
+  to the holder, and returns the NFT to the *creator*. The NFT never changes hands. It is a call on
+  the balance accrued by exercise time, not on the ongoing stream.
+
+Both kinds lock the NFT into the exact same underlying puzzle, so offers, taking, `inspect`,
+`status`, `sync`, and creator clawback of an expired option all work identically for either. The
+only on-chain difference is a single 32-byte value the option commits to, which `pringle option
+inspect` / `recover` re-derive and prove from the chain — so a purchased option's kind is a
+verified fact, not a claim by the seller. Every place an option is shown (`status`,
+`option show-all`, `option inspect`, and the `take`/`exercise` previews) labels the kind and spells
+out what exercise will do.
+
+**Single use.** Exercising consumes the option coin. A sweep option therefore captures only the
+income present when it is exercised; anything that arrives afterward accrues to the creator, who by
+then holds the NFT again. There is no way to exercise a sweep option a second time.
+
+**Per-transaction coin cap.** A p2-singleton coin can only be spent by co-spending the NFT, and the
+mempool rejects any single transaction over `MAX_BLOCK_COST_CLVM / 2` (5,500,000,000 cost). Each
+co-spent coin adds a fixed chunk of cost, so a sweep can only fold in a bounded number of coins at
+once: **662** for a plain `pringle nft sweep` and **655** for a sweep-on-exercise (which also
+carries the option-melt, NFT-exercise, and strike-settlement spends). When more coins than the cap
+are present, the highest-value coins are swept first and the rest are reported as skipped. For
+`pringle nft sweep` the remainder can be swept in a follow-up transaction; for a sweep-*exercise*
+the remainder is left at the address and, because the NFT returns to the creator, becomes the
+creator's to sweep. These caps are pinned against real mempool cost by `tests/cost.rs`.
+
+**Cosmetic NFT-tampering caveat.** The sweep delegated puzzle forces the NFT back to the creator via
+a single odd `CREATE_COIN`; the singleton layer's one-odd-output rule is what stops a holder from
+redirecting or melting it. The remainder of the exercise conditions are holder-supplied, so a sweep
+holder can additionally emit NFT metadata (`-24`) or owner/royalty (`-10`) conditions on the
+returned NFT. This is purely cosmetic: it cannot move the NFT to anyone but the creator, and it
+cannot affect the income address, which derives from the launcher id alone.
 
 > [!WARNING]
 > This tool operates on **mainnet with real XCH** and stores your private key **unencrypted** on
@@ -118,8 +161,10 @@ pringle nft address
 pringle nft sweep --fee 100000
 pringle nft sweep --address xch1... --fee 100000
 
-# 5. Create an NFT-backed XCH option.
+# 5. Create an NFT-backed XCH option. --kind selects what exercise does (see "Option kinds"):
+#    transfer (default) hands over the NFT; sweep pays out the accrued income and keeps the NFT.
 pringle option create --strike 5000000000000 --expiration 1893456000 --fee 100000
+pringle option create --kind sweep --strike 5000000000000 --expiration 1893456000 --fee 100000
 
 # 6a. Sell the option: write an offer, or accept one selling an option for XCH.
 pringle option offer --request 250000000 --output option.offer
@@ -134,7 +179,8 @@ pringle option inspect received.offer --fee 100000
 # recovers them from the chain automatically. If the option wasn't confirmed yet, run:
 pringle option recover
 
-# 6b. Or, as the option owner, exercise before expiration: pay the strike, receive the NFT.
+# 6b. Or, as the option owner, exercise before expiration: pay the strike and either receive the
+# NFT (transfer kind) or sweep out the accrued income while the NFT returns to the creator (sweep).
 # `show-all` refreshes from the chain, prints full launcher ids, and provides copyable
 # exercise commands. By default it hides expired/exercised/transferred options.
 pringle option show-all

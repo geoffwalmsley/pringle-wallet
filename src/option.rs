@@ -9,20 +9,24 @@ use anyhow::Result;
 use chia_wallet_sdk::chia::puzzle_types::offer::{
     NotarizedPayment, Payment, SettlementPaymentsSolution,
 };
-use chia_wallet_sdk::chia::puzzle_types::Memos;
-use chia_wallet_sdk::driver::DriverError;
+use chia_wallet_sdk::chia::puzzle_types::{EveProof, Memos, Proof};
+use chia_wallet_sdk::clvm_traits::clvm_quote;
+use chia_wallet_sdk::driver::{DriverError, P2SingletonLayer};
 use chia_wallet_sdk::prelude::{
     run_puzzle, Action, Allocator, AssetInfo, Bytes, Bytes32, Coin, CoinSpend, Condition,
-    Conditions, FromClvm, Id, Layer, Nft, NodePtr, Offer, OptionContract, OptionInfo,
-    OptionLauncher, OptionLauncherInfo, OptionType, OptionUnderlying, PublicKey, Puzzle, Relation,
-    RequestedPayments, SettlementLayer, SingletonInfo, SpendBundle, SpendContext,
-    SpendWithConditions, Spends, StandardLayer, ToClvm, ToTreeHash,
+    Conditions, FromClvm, Id, Launcher, Layer, Nft, NodePtr, Offer, OptionContract, OptionInfo,
+    OptionLauncher, OptionLauncherInfo, OptionMetadata, OptionType, OptionUnderlying, PublicKey,
+    Puzzle, Relation, RequestedPayments, SettlementLayer, SingletonInfo, Spend, SpendBundle,
+    SpendContext, SpendWithConditions, Spends, StandardLayer, ToClvm, ToTreeHash,
 };
 use chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH;
 use chia_wallet_sdk::types::announcement_id;
 use indexmap::IndexMap;
 
-use crate::state::{from_hex, to_hex, CoinJson, OptionOrigin, OptionRecord, Phase, ProofJson};
+use crate::state::{
+    from_hex, to_hex, CoinJson, OptionKind, OptionOrigin, OptionRecord, Phase, ProofJson,
+};
+use crate::sweep_option::{self, SweepTerms};
 use crate::wallet::{spend_selection, Selection};
 
 /// The output value (singleton amount, odd) an option mint requires from the wallet.
@@ -96,6 +100,107 @@ pub fn build_create(
     })
 }
 
+/// Builds a **sweep**-kind option mint locking `nft` as the underlying, with an XCH strike.
+///
+/// The NFT is locked into the exact same [`OptionUnderlying`] puzzle as [`build_create`], so
+/// the lock, clawback path, offers, and sync are all shared. The only difference is that the
+/// option singleton commits to the *sweep* delegated puzzle (see [`crate::sweep_option`]):
+/// exercising it returns the NFT to the creator and pays the accumulated p2_singleton income
+/// to the holder, instead of transferring the NFT to the holder.
+///
+/// [`OptionLauncher::with_underlying`] hardcodes the standard delegated puzzle hash, so this
+/// builds the launcher and mints the eve option directly (mirroring `OptionLauncher::mint`)
+/// to curry in the sweep hash. The resulting singleton still uses the stock
+/// `OptionContractArgs`, which is why offers and sync remain kind-agnostic.
+#[allow(clippy::too_many_arguments)]
+pub fn build_create_sweep(
+    ctx: &mut SpendContext,
+    layer: &StandardLayer,
+    nft: Nft,
+    selection: &Selection,
+    strike_amount: u64,
+    expiration_seconds: u64,
+    creator_puzzle_hash: Bytes32,
+    owner_puzzle_hash: Bytes32,
+    change_puzzle_hash: Bytes32,
+    fee: u64,
+) -> Result<OptionOutcome> {
+    let parent = selection.coins[0];
+    let underlying_amount = nft.coin.amount;
+
+    // Build the launcher exactly as `OptionLauncher::new` does: a singleton launcher hinted
+    // with the creator puzzle hash, minted from the parent coin.
+    let launcher_memos = ctx.hint(creator_puzzle_hash)?;
+    let launcher = Launcher::with_memos(parent.coin_id(), 1, launcher_memos)
+        .with_singleton_amount(OPTION_OUTPUT_VALUE);
+    let launcher_coin = launcher.coin();
+    let launcher_id = launcher_coin.coin_id();
+
+    // Lock the NFT into the identical underlying puzzle (kind-independent).
+    let terms = SweepTerms {
+        launcher_id,
+        creator_puzzle_hash,
+        expiration_seconds,
+        underlying_amount,
+        strike_amount,
+    };
+    let p2_option: Bytes32 = terms.underlying().tree_hash().into();
+    let locked_nft = nft.transfer(ctx, layer, p2_option, Conditions::new())?;
+
+    // Commit the option to the SWEEP delegated puzzle hash instead of the standard one.
+    let underlying_delegated_puzzle_hash = sweep_option::delegated_puzzle_hash(ctx, &terms)?;
+    let info = OptionInfo::new(
+        launcher_id,
+        locked_nft.coin.coin_id(),
+        underlying_delegated_puzzle_hash,
+        owner_puzzle_hash,
+    );
+
+    // Mint the eve option and its first child, mirroring `OptionLauncher::mint` /`mint_eve`.
+    let metadata = OptionMetadata::new(
+        expiration_seconds,
+        OptionType::Xch {
+            amount: strike_amount,
+        },
+    );
+    let mint_memos = ctx.hint(owner_puzzle_hash)?;
+    let conditions =
+        Conditions::new().create_coin(owner_puzzle_hash, OPTION_OUTPUT_VALUE, mint_memos);
+    let inner_puzzle = ctx.alloc(&clvm_quote!(conditions))?;
+    let eve_p2_puzzle_hash: Bytes32 = ctx.tree_hash(inner_puzzle).into();
+    let inner_spend = Spend::new(inner_puzzle, NodePtr::NIL);
+
+    let eve_info = OptionInfo {
+        p2_puzzle_hash: eve_p2_puzzle_hash,
+        ..info
+    };
+    let (mint_conditions, eve_coin) =
+        launcher.spend(ctx, eve_info.inner_puzzle_hash().into(), metadata)?;
+    let proof = Proof::Eve(EveProof {
+        parent_parent_coin_info: launcher_coin.parent_coin_info,
+        parent_amount: launcher_coin.amount,
+    });
+    let eve_option = OptionContract::new(eve_coin, proof, eve_info);
+    eve_option.spend(ctx, inner_spend)?;
+    let option = eve_option.child(owner_puzzle_hash, OPTION_OUTPUT_VALUE);
+
+    spend_selection(
+        ctx,
+        layer,
+        selection,
+        mint_conditions,
+        change_puzzle_hash,
+        fee,
+    )?;
+
+    Ok(OptionOutcome {
+        option,
+        locked_nft,
+        launcher_id,
+        underlying_delegated_puzzle_hash,
+    })
+}
+
 /// Builds a persistable [`OptionRecord`] from an option outcome and its terms.
 #[allow(clippy::too_many_arguments)]
 pub fn option_to_record(
@@ -104,6 +209,7 @@ pub fn option_to_record(
     expiration_seconds: u64,
     creator_puzzle_hash: Bytes32,
     owner_puzzle_hash: Bytes32,
+    kind: OptionKind,
     phase: Phase,
 ) -> OptionRecord {
     OptionRecord {
@@ -120,6 +226,7 @@ pub fn option_to_record(
         underlying_coin_id: Some(to_hex(outcome.locked_nft.coin.coin_id())),
         nft_launcher_id: Some(to_hex(outcome.locked_nft.info.launcher_id)),
         origin: OptionOrigin::Created,
+        kind,
         terms_known: true,
         underlying_reclaimed: false,
     }
@@ -292,6 +399,8 @@ pub fn purchased_option_record(outcome: &TakeOutcome, owner_puzzle_hash: Bytes32
         underlying_coin_id: Some(to_hex(outcome.option.info.underlying_coin_id)),
         nft_launcher_id: None,
         origin: OptionOrigin::Purchased,
+        // Provisional: the true kind is proven during `option recover`.
+        kind: OptionKind::Transfer,
         terms_known: false,
         underlying_reclaimed: false,
     }
@@ -584,6 +693,168 @@ pub fn build_exercise(
 
     Ok(ExerciseOutcome {
         nft,
+        strike_settlement_coin,
+    })
+}
+
+/// The result of exercising a **sweep**-kind option.
+#[derive(Debug, Clone)]
+pub struct SweepExerciseOutcome {
+    /// The underlying NFT, recreated under the *creator's* control (it does not go to the
+    /// holder). Its launcher id and metadata are unchanged.
+    pub returned_nft: Nft,
+    /// The income payout coin created for the holder.
+    pub payout_coin: Coin,
+    /// The mojos paid out to the holder (the swept total, minus any 1-mojo odd donation).
+    pub swept_amount: u64,
+    /// The full balance of the p2_singleton coins that were swept.
+    pub total_swept: u64,
+    /// The number of p2_singleton coins swept.
+    pub coins_swept: usize,
+    /// The 1-mojo fee donation used to keep the payout even (0 or 1).
+    pub odd_donation: u64,
+    /// The settlement coin created to pay the strike to the creator.
+    pub strike_settlement_coin: Coin,
+}
+
+/// Builds an exercise of a **sweep**-kind XCH-strike option whose underlying is `locked_nft`.
+///
+/// Unlike [`build_exercise`], this does not transfer the NFT to the holder. Instead it
+/// atomically: (1) melts the option singleton while authorizing the underlying spend,
+/// (2) releases the NFT through the sweep delegated puzzle, which forces it back to the
+/// creator and authorizes the p2_singleton coins, (3) co-spends those p2_singleton coins,
+/// paying their balance to `payout_puzzle_hash` (the holder), and (4) pays `strike_amount`
+/// XCH to the creator from `selection`.
+///
+/// `p2_coins` must already be capped (see [`crate::p2_singleton::plan_sweep`]); any coins not
+/// included are left at the p2_singleton address and, since the NFT returns to the creator,
+/// become the creator's to sweep. All coin spends are added to `ctx`; the caller signs
+/// `ctx.take()` and submits it. Exercise is only valid before `expiration_seconds`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_sweep_exercise(
+    ctx: &mut SpendContext,
+    owner_layer: &StandardLayer,
+    option: OptionContract,
+    locked_nft: Nft,
+    creator_puzzle_hash: Bytes32,
+    expiration_seconds: u64,
+    strike_amount: u64,
+    payout_puzzle_hash: Bytes32,
+    p2_coins: &[Coin],
+    selection: &Selection,
+    change_puzzle_hash: Bytes32,
+    fee: u64,
+    // Normally empty. Adversarial tests use this to inject extra tail conditions (e.g. a
+    // second odd CREATE_COIN) to confirm the singleton layer rejects NFT redirection/melt.
+    extra_tail: Conditions,
+) -> Result<SweepExerciseOutcome> {
+    let underlying_amount = locked_nft.coin.amount;
+    let terms = SweepTerms {
+        launcher_id: option.info.launcher_id,
+        creator_puzzle_hash,
+        expiration_seconds,
+        underlying_amount,
+        strike_amount,
+    };
+    let underlying = terms.underlying();
+
+    // The reconstructed underlying must match the puzzle the NFT is actually locked in.
+    if Bytes32::from(underlying.tree_hash()) != locked_nft.info.p2_puzzle_hash {
+        anyhow::bail!(
+            "reconstructed option underlying does not match the locked NFT; state may be inconsistent"
+        );
+    }
+
+    // Also confirm the option really commits to the sweep delegated puzzle for these terms,
+    // so we fail loudly here rather than with an opaque on-chain error.
+    let sweep_hash = sweep_option::delegated_puzzle_hash(ctx, &terms)?;
+    if sweep_hash != option.info.underlying_delegated_puzzle_hash {
+        anyhow::bail!(
+            "option does not commit to the sweep delegated puzzle for these terms; \
+             it may be a transfer-kind option or the terms may be wrong"
+        );
+    }
+
+    let total_swept = p2_coins
+        .iter()
+        .try_fold(0u64, |sum, coin| sum.checked_add(coin.amount))
+        .ok_or_else(|| anyhow::anyhow!("p2_singleton balance overflows u64"))?;
+    if total_swept == 0 {
+        anyhow::bail!("there is no p2_singleton income to sweep for this option");
+    }
+    // The singleton layer allows exactly one odd output (the returned NFT), so the holder's
+    // payout must be even. Donate the odd mojo to the fee when the total is odd.
+    let odd_donation = total_swept % 2;
+    let swept_amount = total_swept - odd_donation;
+    if swept_amount == 0 {
+        anyhow::bail!("the p2_singleton income is too small to sweep (a single mojo)");
+    }
+
+    let option_inner_puzzle_hash: Bytes32 = option.info.inner_puzzle_hash().into();
+    let option_amount = option.coin.amount;
+
+    // 1. Spend the option singleton: melt it and authorize the underlying via a message.
+    option.exercise(ctx, owner_layer, Conditions::new())?;
+
+    // 2. Release the NFT through the sweep delegated puzzle. It returns to the creator, and
+    //    emits a puzzle announcement authorizing each co-spent p2_singleton coin.
+    let p2_coin_ids: Vec<Bytes32> = p2_coins.iter().map(Coin::coin_id).collect();
+    let exercise_spend = sweep_option::sweep_exercise_spend(
+        ctx,
+        &terms,
+        &p2_coin_ids,
+        payout_puzzle_hash,
+        swept_amount,
+        odd_donation,
+        option_inner_puzzle_hash,
+        option_amount,
+        extra_tail,
+    )?;
+    let returned_nft = locked_nft.spend(ctx, exercise_spend)?;
+
+    // 3. Co-spend each p2_singleton coin, authorized by the NFT's puzzle announcements. The
+    //    p2_singleton is controlled by the *NFT's* launcher id, not the option launcher id.
+    let p2 = P2SingletonLayer::new(locked_nft.info.launcher_id);
+    let nft_inner_puzzle_hash: Bytes32 = locked_nft.info.inner_puzzle_hash().into();
+    for coin in p2_coins {
+        p2.spend_coin(ctx, *coin, nft_inner_puzzle_hash)?;
+    }
+
+    // 4. Fund the strike settlement coin from the wallet, then pay it out to the creator.
+    let strike_primary =
+        Conditions::new().create_coin(SETTLEMENT_PAYMENT_HASH.into(), strike_amount, Memos::None);
+    spend_selection(
+        ctx,
+        owner_layer,
+        selection,
+        strike_primary,
+        change_puzzle_hash,
+        fee,
+    )?;
+
+    let strike_settlement_coin = Coin::new(
+        selection.coins[0].coin_id(),
+        SETTLEMENT_PAYMENT_HASH.into(),
+        strike_amount,
+    );
+    let payment = underlying.requested_payment(&mut **ctx)?;
+    let strike_spend = SettlementLayer.construct_coin_spend(
+        ctx,
+        strike_settlement_coin,
+        SettlementPaymentsSolution::new(vec![payment]),
+    )?;
+    ctx.insert(strike_spend);
+
+    // The payout coin is created by the NFT spend, so its parent is the locked NFT coin.
+    let payout_coin = Coin::new(locked_nft.coin.coin_id(), payout_puzzle_hash, swept_amount);
+
+    Ok(SweepExerciseOutcome {
+        returned_nft,
+        payout_coin,
+        swept_amount,
+        total_swept,
+        coins_swept: p2_coins.len(),
+        odd_donation,
         strike_settlement_coin,
     })
 }

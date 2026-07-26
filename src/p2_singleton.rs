@@ -65,6 +65,75 @@ pub fn build_fund(
     Ok(Coin::new(selection.coins[0].coin_id(), target, amount))
 }
 
+/// The most p2_singleton coins a plain `nft sweep` can spend in one transaction.
+///
+/// The mempool rejects any single transaction whose CLVM cost exceeds
+/// `MAX_BLOCK_COST_CLVM / 2 = 5,500,000,000`. Each additional co-spent p2_singleton coin adds
+/// ~8,210,842 cost (dominated by ~680 bytes at 12,000/byte). Empirically a plain sweep of 662
+/// coins costs 5,498,659,394 and 663 costs 5,506,870,736, so 662 is the cap. Pinned by the
+/// cost tests in `tests/cost.rs`.
+pub const MAX_SWEEP_COINS: usize = 662;
+
+/// The most p2_singleton coins a sweep-on-exercise can spend in one transaction.
+///
+/// A sweep-exercise carries the extra option-melt, NFT exercise, and strike-settlement
+/// spends, leaving a slightly smaller budget for p2_singleton coins than a plain sweep.
+/// Pinned by the cost tests in `tests/cost.rs`.
+pub const MAX_EXERCISE_SWEEP_COINS: usize = 655;
+
+/// A selection of p2_singleton coins to sweep, capped to fit in one transaction.
+///
+/// Highest-value coins are selected first (see [`plan_sweep`]) so that when the balance
+/// spans more coins than a single transaction can hold, the most value is captured.
+#[derive(Debug, Clone)]
+pub struct SweepPlan {
+    /// The coins that will be swept, highest value first, at most `max_coins`.
+    pub selected: Vec<Coin>,
+    /// The coins left behind because the cap was reached.
+    pub skipped: Vec<Coin>,
+    /// The combined value of `selected`.
+    pub selected_total: u64,
+    /// The combined value of `skipped`.
+    pub skipped_total: u64,
+}
+
+impl SweepPlan {
+    /// Whether any coins were left behind because the per-transaction cap was reached.
+    pub fn has_skipped(&self) -> bool {
+        !self.skipped.is_empty()
+    }
+}
+
+/// Plans a sweep of `coins`, selecting at most `max_coins` of the highest value first.
+///
+/// A single Chia transaction can only co-spend so many p2_singleton coins before exceeding
+/// the mempool cost cap (see [`MAX_SWEEP_COINS`] / [`MAX_EXERCISE_SWEEP_COINS`]). When there
+/// are more coins than the cap, this keeps the highest-value ones (tie-broken by coin id for
+/// determinism) and reports the rest as skipped so the caller can warn the user.
+pub fn plan_sweep(coins: &[Coin], max_coins: usize) -> SweepPlan {
+    let mut sorted: Vec<Coin> = coins.to_vec();
+    // Highest amount first; break ties by coin id so the plan is deterministic.
+    sorted.sort_by(|a, b| {
+        b.amount
+            .cmp(&a.amount)
+            .then_with(|| a.coin_id().cmp(&b.coin_id()))
+    });
+
+    let split = sorted.len().min(max_coins);
+    let skipped = sorted.split_off(split);
+    let selected = sorted;
+
+    let selected_total = selected.iter().map(|c| c.amount).sum();
+    let skipped_total = skipped.iter().map(|c| c.amount).sum();
+
+    SweepPlan {
+        selected,
+        skipped,
+        selected_total,
+        skipped_total,
+    }
+}
+
 /// The result of sweeping the p2_singleton balance to a destination.
 #[derive(Debug, Clone)]
 pub struct SweepOutcome {
@@ -172,6 +241,51 @@ mod tests {
     fn address_uses_mainnet_prefix() {
         let launcher_id = Bytes32::new([4u8; 32]);
         assert!(address(launcher_id).unwrap().starts_with("xch1"));
+    }
+
+    fn coin_of(amount: u64, seed: u8) -> Coin {
+        Coin::new(Bytes32::new([seed; 32]), Bytes32::new([1u8; 32]), amount)
+    }
+
+    #[test]
+    fn plan_sweep_keeps_highest_value_first_within_cap() {
+        let coins = vec![
+            coin_of(10, 1),
+            coin_of(50, 2),
+            coin_of(30, 3),
+            coin_of(70, 4),
+        ];
+        let plan = plan_sweep(&coins, 2);
+        assert_eq!(plan.selected.len(), 2);
+        assert_eq!(plan.skipped.len(), 2);
+        // The two highest-value coins are selected.
+        assert_eq!(plan.selected[0].amount, 70);
+        assert_eq!(plan.selected[1].amount, 50);
+        assert_eq!(plan.selected_total, 120);
+        assert_eq!(plan.skipped_total, 40);
+        assert!(plan.has_skipped());
+    }
+
+    #[test]
+    fn plan_sweep_takes_everything_under_cap() {
+        let coins = vec![coin_of(10, 1), coin_of(20, 2)];
+        let plan = plan_sweep(&coins, 662);
+        assert_eq!(plan.selected.len(), 2);
+        assert!(plan.skipped.is_empty());
+        assert_eq!(plan.selected_total, 30);
+        assert!(!plan.has_skipped());
+    }
+
+    #[test]
+    fn plan_sweep_is_deterministic_on_ties() {
+        // Equal amounts are tie-broken by coin id, so the plan is stable across runs.
+        let coins = vec![coin_of(5, 9), coin_of(5, 1), coin_of(5, 4)];
+        let a = plan_sweep(&coins, 2);
+        let b = plan_sweep(&coins, 2);
+        assert_eq!(
+            a.selected.iter().map(|c| c.coin_id()).collect::<Vec<_>>(),
+            b.selected.iter().map(|c| c.coin_id()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

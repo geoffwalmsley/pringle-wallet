@@ -2,7 +2,30 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+use pringle_wallet::state::OptionKind;
+
+/// The option kind selectable on `option create`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+#[value(rename_all = "kebab-case")]
+pub enum OptionKindArg {
+    /// Exercising transfers the NFT (and all its future income) to the holder.
+    #[default]
+    Transfer,
+    /// Exercising sweeps the NFT's accumulated income to the holder and returns the NFT to
+    /// the creator.
+    Sweep,
+}
+
+impl From<OptionKindArg> for OptionKind {
+    fn from(arg: OptionKindArg) -> Self {
+        match arg {
+            OptionKindArg::Transfer => OptionKind::Transfer,
+            OptionKindArg::Sweep => OptionKind::Sweep,
+        }
+    }
+}
 
 /// A simple mainnet Chia CLI: keys, XCH, NFTs, and NFT-backed options.
 ///
@@ -180,6 +203,12 @@ pub enum OptionCommand {
     },
     /// Create an option contract with the NFT as the underlying and an XCH strike.
     Create {
+        /// What exercising the option does:
+        /// `transfer` hands the NFT (and its future income) to the holder;
+        /// `sweep` pays the holder the income accrued at exercise and returns the NFT to the
+        /// creator.
+        #[arg(long, value_enum, default_value_t = OptionKindArg::Transfer)]
+        kind: OptionKindArg,
         /// The XCH strike amount in mojos (paid by the exerciser to the creator).
         #[arg(long)]
         strike: u64,
