@@ -275,6 +275,42 @@ pub enum OptionOrigin {
     Purchased,
 }
 
+/// The kind of an option: what exercising it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionKind {
+    /// Exercising transfers the underlying NFT (and all its future income) to the holder.
+    /// This is the original kind, and the default for records that predate this field.
+    #[default]
+    Transfer,
+    /// Exercising sweeps the income accumulated at the NFT's p2_singleton to the holder and
+    /// returns the NFT to the creator. The NFT itself never changes hands.
+    Sweep,
+}
+
+impl OptionKind {
+    /// A short lowercase label for CLI/JSON output.
+    pub fn label(self) -> &'static str {
+        match self {
+            OptionKind::Transfer => "transfer",
+            OptionKind::Sweep => "sweep",
+        }
+    }
+
+    /// A one-line description of what exercising this kind of option does.
+    pub fn exercise_semantics(self) -> &'static str {
+        match self {
+            OptionKind::Transfer => {
+                "on exercise the NFT and all its future income transfer to the holder"
+            }
+            OptionKind::Sweep => {
+                "on exercise the holder takes the income held at that moment; \
+                 the NFT returns to the creator"
+            }
+        }
+    }
+}
+
 /// The option contract created on (or purchased for) the NFT.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptionRecord {
@@ -304,6 +340,12 @@ pub struct OptionRecord {
     /// Whether this option was created by us or purchased via an offer.
     #[serde(default)]
     pub origin: OptionOrigin,
+    /// What exercising this option does (transfer the NFT vs. sweep its income). Defaults to
+    /// [`OptionKind::Transfer`] for records written before this field existed. For a purchased
+    /// option this is provisional until `terms_known` is true (the kind is proven during
+    /// recovery), mirroring how strike/expiration are placeheld at 0.
+    #[serde(default)]
+    pub kind: OptionKind,
     /// True when the terms (strike/expiration/creator) are known-good (recovered/verified),
     /// false for a purchased option whose terms have not yet been recovered from the chain.
     #[serde(default = "default_true")]
@@ -693,6 +735,29 @@ mod tests {
         let record: OptionRecord = serde_json::from_value(json).unwrap();
         assert!(!record.underlying_reclaimed);
         assert!(record.terms_known); // also defaults to true
+                                     // A record with no `kind` field loads as a transfer option.
+        assert_eq!(record.kind, OptionKind::Transfer);
+    }
+
+    #[test]
+    fn option_record_roundtrips_sweep_kind() {
+        // An explicit sweep kind survives a serialize/deserialize round-trip.
+        let json = serde_json::json!({
+            "launcher_id": "0xaa",
+            "coin": {"parent_coin_info": "0x01", "puzzle_hash": "0x02", "amount": 1},
+            "underlying_nft_coin": {"parent_coin_info": "0x03", "puzzle_hash": "0x04", "amount": 1},
+            "underlying_delegated_puzzle_hash": "0x05",
+            "strike_amount": 1000,
+            "expiration_seconds": 2000,
+            "creator_puzzle_hash": "0x06",
+            "owner_puzzle_hash": "0x07",
+            "phase": "confirmed",
+            "kind": "sweep"
+        });
+        let record: OptionRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(record.kind, OptionKind::Sweep);
+        let reserialized = serde_json::to_value(&record).unwrap();
+        assert_eq!(reserialized["kind"], "sweep");
     }
 
     #[test]

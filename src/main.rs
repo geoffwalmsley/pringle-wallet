@@ -4,7 +4,9 @@ mod cli;
 
 use anyhow::{Context, Result};
 use chia_wallet_sdk::driver::{decode_offer, encode_offer};
-use chia_wallet_sdk::prelude::{Address, Bytes32, Coin, Offer, OptionContract, SpendContext};
+use chia_wallet_sdk::prelude::{
+    Address, Bytes32, Coin, Conditions, Offer, OptionContract, SpendContext,
+};
 use clap::Parser;
 use serde_json::{json, Value};
 
@@ -21,7 +23,8 @@ use pringle_wallet::p2_singleton;
 use pringle_wallet::potato;
 use pringle_wallet::signing::sign_spend_bundle;
 use pringle_wallet::state::{
-    from_hex, to_hex, CoinJson, OptionRecord, Phase, PotatoCache, ProofJson, State, TxRecord,
+    from_hex, to_hex, CoinJson, OptionKind, OptionRecord, Phase, PotatoCache, ProofJson, State,
+    TxRecord,
 };
 use pringle_wallet::status_view;
 use pringle_wallet::sync;
@@ -108,6 +111,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 cached,
             } => cmd_option_show_all(&key_file, &state_file, include_closed, cached).await,
             OptionCommand::Create {
+                kind,
                 strike,
                 expiration,
                 creator_address,
@@ -118,6 +122,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 cmd_option_create(
                     &key_file,
                     &state_file,
+                    kind.into(),
                     strike,
                     expiration,
                     creator_address,
@@ -1003,20 +1008,37 @@ async fn cmd_nft_sweep(
     }
 
     let p2_puzzle_hash = from_hex(&p2_record.puzzle_hash)?;
-    let p2_coins = coinset.unspent_coins(p2_puzzle_hash).await?;
-    if p2_coins.is_empty() {
+    let all_p2_coins = coinset.unspent_coins(p2_puzzle_hash).await?;
+    if all_p2_coins.is_empty() {
         return Err(AppError::recoverable(
             "the p2 singleton has no confirmed, unspent coins to sweep",
         )
         .into());
     }
 
-    let total: u64 = p2_coins.iter().map(|c| c.amount).sum();
-    let preview = ActionPreview::new("Sweep p2 singleton")
+    // A single transaction can only co-spend so many p2_singleton coins before hitting the
+    // mempool cost cap. Select the highest-value coins first and report any left behind.
+    let plan = p2_singleton::plan_sweep(&all_p2_coins, p2_singleton::MAX_SWEEP_COINS);
+    let p2_coins = plan.selected.clone();
+
+    let total: u64 = plan.selected_total;
+    let mut preview = ActionPreview::new("Sweep p2 singleton")
         .detail("Coins", p2_coins.len().to_string())
         .detail("Total balance", format::xch(total))
         .detail("Fee", format::xch(fee))
         .detail("Destination", &destination_label);
+    if plan.has_skipped() {
+        preview = preview.detail(
+            "WARNING coins over cap",
+            format!(
+                "{} coin(s) worth {} exceed the {}-coin per-transaction cap and will be left \
+                 behind; sweep them in a follow-up transaction",
+                plan.skipped.len(),
+                format::xch(plan.skipped_total),
+                p2_singleton::MAX_SWEEP_COINS
+            ),
+        );
+    }
     if !confirm_or_abort(&preview, assume_yes)? {
         return Ok(());
     }
@@ -1103,8 +1125,20 @@ async fn cmd_nft_sweep(
             "NFT recreated",
             to_hex(outcome.new_nft.coin.coin_id()),
             "new_nft_coin_id",
-        )
-        .note("Submitted, not yet confirmed. Run `pringle status` to watch it settle.");
+        );
+    if plan.has_skipped() {
+        report.field_json(
+            "Coins left behind (over cap)",
+            format!(
+                "{} ({}) — sweep again to collect them",
+                plan.skipped.len(),
+                format::xch(plan.skipped_total)
+            ),
+            "skipped_coins",
+            Value::from(plan.skipped.len()),
+        );
+    }
+    report.note("Submitted, not yet confirmed. Run `pringle status` to watch it settle.");
     report.emit();
     Ok(())
 }
@@ -1181,6 +1215,7 @@ async fn cmd_option_show_all(
                     "state": user_state.machine(),
                     "open": open,
                     "terms_known": option.terms_known,
+                    "kind": option.terms_known.then_some(option.kind.label()),
                     "strike_mojos": option.terms_known.then_some(option.strike_amount),
                     "expiration_seconds": option.terms_known.then_some(option.expiration_seconds),
                     "creator_puzzle_hash": option.terms_known.then_some(&option.creator_puzzle_hash),
@@ -1233,6 +1268,11 @@ async fn cmd_option_show_all(
         println!("\n  Launcher:   {}", option.launcher_id);
         println!("  State:      {}", user_state.label());
         if option.terms_known {
+            println!(
+                "  Kind:       {} ({})",
+                option.kind.label(),
+                option.kind.exercise_semantics()
+            );
             println!("  Strike:     {}", format::xch(option.strike_amount));
             println!(
                 "  Expiration: {}",
@@ -1267,6 +1307,7 @@ async fn cmd_option_show_all(
 async fn cmd_option_create(
     key_file: &Path,
     state_file: &Path,
+    kind: OptionKind,
     strike: u64,
     expiration: u64,
     creator_address: Option<String>,
@@ -1304,6 +1345,8 @@ async fn cmd_option_create(
     let selection = select_for(coins, option_contract::OPTION_OUTPUT_VALUE, fee)?;
 
     let preview = ActionPreview::new("Create option")
+        .detail("Kind", kind.label())
+        .detail("Exercise", kind.exercise_semantics())
         .detail("Underlying NFT", &nft_record.launcher_id)
         .detail("Strike", format::xch(strike))
         .detail("Expiration", format::expiration(expiration, now_seconds()))
@@ -1314,18 +1357,32 @@ async fn cmd_option_create(
 
     let mut ctx = SpendContext::new();
     let nft = nft::nft_from_record(&mut ctx, &nft_record)?;
-    let outcome = option_contract::build_create(
-        &mut ctx,
-        &wallet.standard_layer(),
-        nft,
-        &selection,
-        strike,
-        expiration,
-        creator_puzzle_hash,
-        owner_puzzle_hash,
-        wallet.puzzle_hash(),
-        fee,
-    )?;
+    let outcome = match kind {
+        OptionKind::Transfer => option_contract::build_create(
+            &mut ctx,
+            &wallet.standard_layer(),
+            nft,
+            &selection,
+            strike,
+            expiration,
+            creator_puzzle_hash,
+            owner_puzzle_hash,
+            wallet.puzzle_hash(),
+            fee,
+        )?,
+        OptionKind::Sweep => option_contract::build_create_sweep(
+            &mut ctx,
+            &wallet.standard_layer(),
+            nft,
+            &selection,
+            strike,
+            expiration,
+            creator_puzzle_hash,
+            owner_puzzle_hash,
+            wallet.puzzle_hash(),
+            fee,
+        )?,
+    };
 
     let bundle = sign_spend_bundle(ctx.take(), &[wallet.synthetic_secret_key().clone()])?;
     coinset.push_tx(bundle).await?;
@@ -1344,6 +1401,7 @@ async fn cmd_option_create(
         expiration,
         creator_puzzle_hash,
         owner_puzzle_hash,
+        kind,
         Phase::Pending,
     ));
     // The wallet-owned NFT coin is now superseded by the locked one.
@@ -1368,6 +1426,7 @@ async fn cmd_option_create(
             to_hex(outcome.option.coin.coin_id()),
             "option_coin_id",
         )
+        .field_json("Kind", kind.label(), "kind", Value::from(kind.label()))
         .field("Underlying NFT", &nft_record.launcher_id, "nft_launcher_id")
         .field_json(
             "Strike",
@@ -1623,6 +1682,8 @@ fn take_preview(inspection: &OfferInspection, fee: u64, receive_address: String)
         .detail("Fee", format::xch(fee));
     if let Ok(details) = &inspection.details {
         preview = preview
+            .detail("Kind", details.kind.label())
+            .detail("Exercise", details.kind.exercise_semantics())
             .detail("Strike", format::xch(details.strike_amount))
             .detail(
                 "Expiration",
@@ -1830,6 +1891,16 @@ fn emit_inspection_report(
         Ok(details) => {
             report
                 .field_json(
+                    "Kind",
+                    format!(
+                        "{} ({})",
+                        details.kind.label(),
+                        details.kind.exercise_semantics()
+                    ),
+                    "kind",
+                    Value::from(details.kind.label()),
+                )
+                .field_json(
                     "Strike",
                     format::xch(details.strike_amount),
                     "strike_mojos",
@@ -1994,6 +2065,8 @@ async fn recover_option_terms(
         rec.creator_puzzle_hash = to_hex(details.creator_puzzle_hash);
         rec.underlying_nft_coin = CoinJson::from_coin(details.underlying_coin);
         rec.nft_launcher_id = Some(nft_launcher);
+        // The recovered delegated puzzle hash proves which kind of option this is.
+        rec.kind = details.kind;
         rec.terms_known = true;
     }
     state.save(state_file)?;
@@ -2015,6 +2088,16 @@ async fn cmd_option_recover(state_file: &Path, launcher: Option<&str>) -> Result
     report
         .field("Option launcher", &recovered.launcher_id, "launcher_id")
         .primary()
+        .field_json(
+            "Kind",
+            format!(
+                "{} ({})",
+                recovered.kind.label(),
+                recovered.kind.exercise_semantics()
+            ),
+            "kind",
+            Value::from(recovered.kind.label()),
+        )
         .field_json(
             "Strike",
             format::xch(recovered.strike_amount),
@@ -2112,81 +2195,241 @@ async fn cmd_option_exercise(
     let coins = wallet_spendable_coins(&coinset, &wallet, &state).await?;
     let selection = select_for(coins, option.strike_amount, fee)?;
 
-    let preview = ActionPreview::new("Exercise option")
-        .detail("Pay strike", format::xch(option.strike_amount))
-        .detail("Strike to", to_hex(creator_puzzle_hash))
-        .detail("Receive NFT", nft_record.launcher_id.clone())
-        .detail("Fee", format::xch(fee));
-    if !confirm_or_abort(&preview, assume_yes)? {
-        return Ok(());
+    match option.kind {
+        OptionKind::Transfer => {
+            let preview = ActionPreview::new("Exercise option")
+                .detail("Kind", option.kind.label())
+                .detail("Effect", option.kind.exercise_semantics())
+                .detail("Pay strike", format::xch(option.strike_amount))
+                .detail("Strike to", to_hex(creator_puzzle_hash))
+                .detail("Receive NFT", nft_record.launcher_id.clone())
+                .detail("Fee", format::xch(fee));
+            if !confirm_or_abort(&preview, assume_yes)? {
+                return Ok(());
+            }
+
+            let mut ctx = SpendContext::new();
+            let locked_nft = nft::nft_from_record(&mut ctx, &nft_record)?;
+            let outcome = option_contract::build_exercise(
+                &mut ctx,
+                &wallet.standard_layer(),
+                contract,
+                locked_nft,
+                creator_puzzle_hash,
+                option.expiration_seconds,
+                option.strike_amount,
+                wallet.puzzle_hash(),
+                &selection,
+                wallet.puzzle_hash(),
+                fee,
+            )?;
+
+            let bundle = sign_spend_bundle(ctx.take(), &[wallet.synthetic_secret_key().clone()])?;
+            coinset.push_tx(bundle).await?;
+
+            let mut spent_ids = selection_spent_ids(&selection);
+            spent_ids.push(to_hex(option_coin.coin_id()));
+            spent_ids.push(to_hex(nft_coin.coin_id()));
+            state.transactions.push(TxRecord::new(
+                "option_exercise",
+                spent_ids,
+                to_hex(outcome.nft.coin.coin_id()),
+            ));
+
+            if let Some(rec) = state.option_mut(&option.launcher_id) {
+                rec.phase = Phase::Superseded;
+            }
+            if let Some(rec) = state.nft_mut(&nft_record.launcher_id) {
+                rec.coin = CoinJson::from_coin(outcome.nft.coin);
+                rec.proof = ProofJson::from_proof(outcome.nft.proof);
+                rec.p2_puzzle_hash = to_hex(outcome.nft.info.p2_puzzle_hash);
+                rec.current_owner = outcome.nft.info.current_owner.map(to_hex);
+                rec.phase = Phase::Pending;
+            }
+            state.save(state_file)?;
+
+            let mut report = Report::new("option_exercise", "Submitted option exercise.");
+            report
+                .field_json("Kind", option.kind.label(), "kind", Value::from("transfer"))
+                .field_json(
+                    "Paid strike",
+                    format::xch(option.strike_amount),
+                    "strike_mojos",
+                    Value::from(option.strike_amount),
+                );
+            if fee > 0 {
+                report.field_json("Fee", format::xch(fee), "fee_mojos", Value::from(fee));
+            }
+            report
+                .field(
+                    "Strike paid to",
+                    to_hex(creator_puzzle_hash),
+                    "creator_puzzle_hash",
+                )
+                .field("NFT received", &nft_record.launcher_id, "nft_launcher_id")
+                .primary()
+                .field(
+                    "New NFT coin",
+                    to_hex(outcome.nft.coin.coin_id()),
+                    "new_nft_coin_id",
+                )
+                .field("Now owned by", wallet.address()?, "owner_address");
+            report.emit();
+            Ok(())
+        }
+        OptionKind::Sweep => {
+            let nft_launcher_id = from_hex(&nft_record.launcher_id)?;
+            let balance = inspect::p2_singleton_balance(&coinset, nft_launcher_id).await?;
+            if balance.coins.is_empty() {
+                return Err(AppError::recoverable(
+                    "this sweep option has no p2_singleton income to claim",
+                )
+                .why("there is nothing at the NFT's income address to sweep")
+                .next("exercising would gain nothing; wait for income to accrue first")
+                .into());
+            }
+            let plan =
+                p2_singleton::plan_sweep(&balance.coins, p2_singleton::MAX_EXERCISE_SWEEP_COINS);
+
+            let income_address = wallet.address()?;
+            let mut preview = ActionPreview::new("Exercise option (sweep)")
+                .detail("Kind", option.kind.label())
+                .detail("Effect", option.kind.exercise_semantics())
+                .detail("Pay strike", format::xch(option.strike_amount))
+                .detail("Strike to", to_hex(creator_puzzle_hash))
+                .detail("Sweep income", format::xch(plan.selected_total))
+                .detail("Income to", income_address.clone())
+                .detail("Coins swept", plan.selected.len().to_string())
+                .detail("NFT returns to creator", to_hex(creator_puzzle_hash))
+                .detail("Fee", format::xch(fee));
+            if plan.has_skipped() {
+                preview = preview.detail(
+                    "WARNING coins over cap",
+                    format!(
+                        "{} coin(s) worth {} exceed the {}-coin per-transaction cap and, since a \
+                         sweep option is single-use, are forfeited to the creator",
+                        plan.skipped.len(),
+                        format::xch(plan.skipped_total),
+                        p2_singleton::MAX_EXERCISE_SWEEP_COINS
+                    ),
+                );
+            }
+            if !confirm_or_abort(&preview, assume_yes)? {
+                return Ok(());
+            }
+
+            let mut ctx = SpendContext::new();
+            let locked_nft = nft::nft_from_record(&mut ctx, &nft_record)?;
+            let outcome = option_contract::build_sweep_exercise(
+                &mut ctx,
+                &wallet.standard_layer(),
+                contract,
+                locked_nft,
+                creator_puzzle_hash,
+                option.expiration_seconds,
+                option.strike_amount,
+                wallet.puzzle_hash(),
+                &plan.selected,
+                &selection,
+                wallet.puzzle_hash(),
+                fee,
+                Conditions::new(),
+            )?;
+
+            let bundle = sign_spend_bundle(ctx.take(), &[wallet.synthetic_secret_key().clone()])?;
+            coinset.push_tx(bundle).await?;
+
+            let mut spent_ids = selection_spent_ids(&selection);
+            spent_ids.push(to_hex(option_coin.coin_id()));
+            spent_ids.push(to_hex(nft_coin.coin_id()));
+            for coin in &plan.selected {
+                spent_ids.push(to_hex(coin.coin_id()));
+            }
+            state.transactions.push(TxRecord::new(
+                "option_exercise_sweep",
+                spent_ids,
+                to_hex(outcome.payout_coin.coin_id()),
+            ));
+
+            if let Some(rec) = state.option_mut(&option.launcher_id) {
+                rec.phase = Phase::Superseded;
+            }
+            // The NFT has been returned to the creator; track the new live coin.
+            if let Some(rec) = state.nft_mut(&nft_record.launcher_id) {
+                rec.coin = CoinJson::from_coin(outcome.returned_nft.coin);
+                rec.proof = ProofJson::from_proof(outcome.returned_nft.proof);
+                rec.p2_puzzle_hash = to_hex(outcome.returned_nft.info.p2_puzzle_hash);
+                rec.current_owner = outcome.returned_nft.info.current_owner.map(to_hex);
+                rec.phase = Phase::Pending;
+            }
+            state.save(state_file)?;
+
+            let mut report = Report::new("option_exercise", "Submitted sweep-option exercise.");
+            report
+                .field_json("Kind", option.kind.label(), "kind", Value::from("sweep"))
+                .field_json(
+                    "Paid strike",
+                    format::xch(option.strike_amount),
+                    "strike_mojos",
+                    Value::from(option.strike_amount),
+                );
+            if fee > 0 {
+                report.field_json("Fee", format::xch(fee), "fee_mojos", Value::from(fee));
+            }
+            report
+                .field(
+                    "Strike paid to",
+                    to_hex(creator_puzzle_hash),
+                    "creator_puzzle_hash",
+                )
+                .field_json(
+                    "Income swept",
+                    format::xch(outcome.swept_amount),
+                    "swept_mojos",
+                    Value::from(outcome.swept_amount),
+                )
+                .primary()
+                .field(
+                    "Income coin id",
+                    to_hex(outcome.payout_coin.coin_id()),
+                    "payout_coin_id",
+                )
+                .field_json(
+                    "Coins swept",
+                    outcome.coins_swept.to_string(),
+                    "coins_swept",
+                    Value::from(outcome.coins_swept),
+                )
+                .field("Income to", income_address, "income_address")
+                .field(
+                    "NFT returned to creator",
+                    to_hex(creator_puzzle_hash),
+                    "nft_returned_to",
+                );
+            if outcome.odd_donation > 0 {
+                report.field_json(
+                    "Odd-mojo fee donation",
+                    format::xch(outcome.odd_donation),
+                    "odd_donation_mojos",
+                    Value::from(outcome.odd_donation),
+                );
+            }
+            if plan.has_skipped() {
+                report.field_json(
+                    "Coins forfeited to creator (over cap)",
+                    format!(
+                        "{} ({})",
+                        plan.skipped.len(),
+                        format::xch(plan.skipped_total)
+                    ),
+                    "skipped_coins",
+                    Value::from(plan.skipped.len()),
+                );
+            }
+            report.emit();
+            Ok(())
+        }
     }
-
-    let mut ctx = SpendContext::new();
-    let locked_nft = nft::nft_from_record(&mut ctx, &nft_record)?;
-    let outcome = option_contract::build_exercise(
-        &mut ctx,
-        &wallet.standard_layer(),
-        contract,
-        locked_nft,
-        creator_puzzle_hash,
-        option.expiration_seconds,
-        option.strike_amount,
-        wallet.puzzle_hash(),
-        &selection,
-        wallet.puzzle_hash(),
-        fee,
-    )?;
-
-    let bundle = sign_spend_bundle(ctx.take(), &[wallet.synthetic_secret_key().clone()])?;
-    coinset.push_tx(bundle).await?;
-
-    let mut spent_ids = selection_spent_ids(&selection);
-    spent_ids.push(to_hex(option_coin.coin_id()));
-    spent_ids.push(to_hex(nft_coin.coin_id()));
-    state.transactions.push(TxRecord::new(
-        "option_exercise",
-        spent_ids,
-        to_hex(outcome.nft.coin.coin_id()),
-    ));
-
-    if let Some(rec) = state.option_mut(&option.launcher_id) {
-        rec.phase = Phase::Superseded;
-    }
-    if let Some(rec) = state.nft_mut(&nft_record.launcher_id) {
-        rec.coin = CoinJson::from_coin(outcome.nft.coin);
-        rec.proof = ProofJson::from_proof(outcome.nft.proof);
-        rec.p2_puzzle_hash = to_hex(outcome.nft.info.p2_puzzle_hash);
-        rec.current_owner = outcome.nft.info.current_owner.map(to_hex);
-        rec.phase = Phase::Pending;
-    }
-    state.save(state_file)?;
-
-    let mut report = Report::new("option_exercise", "Submitted option exercise.");
-    report.field_json(
-        "Paid strike",
-        format::xch(option.strike_amount),
-        "strike_mojos",
-        Value::from(option.strike_amount),
-    );
-    if fee > 0 {
-        report.field_json("Fee", format::xch(fee), "fee_mojos", Value::from(fee));
-    }
-    report
-        .field(
-            "Strike paid to",
-            to_hex(creator_puzzle_hash),
-            "creator_puzzle_hash",
-        )
-        .field("NFT received", &nft_record.launcher_id, "nft_launcher_id")
-        .primary()
-        .field(
-            "New NFT coin",
-            to_hex(outcome.nft.coin.coin_id()),
-            "new_nft_coin_id",
-        )
-        .field("Now owned by", wallet.address()?, "owner_address");
-    report.emit();
-    Ok(())
 }
 
 async fn cmd_option_clawback(
@@ -2517,6 +2760,11 @@ async fn cmd_status(key_file: &Path, state_file: &Path, cached: bool) -> Result<
             user.label()
         );
         if option.terms_known {
+            println!(
+                "      kind:       {} ({})",
+                option.kind.label(),
+                option.kind.exercise_semantics()
+            );
             println!("      strike:     {}", format::xch(option.strike_amount));
             println!(
                 "      expiration: {}{}",
@@ -2557,10 +2805,14 @@ async fn cmd_status(key_file: &Path, state_file: &Path, cached: bool) -> Result<
 }
 
 /// Whether an option is eligible for a creator clawback of its expired underlying NFT:
-/// terms known, created by this wallet, past expiry, not yet reclaimed, and its NFT linked.
+/// terms known, created by this wallet, past expiry, not yet reclaimed, its NFT linked, and
+/// still open. An exercised option (phase `Superseded`) is never eligible: for a transfer
+/// option the NFT went to the holder, and for a sweep option the NFT has already come home to
+/// the creator — either way there is nothing locked left to reclaim.
 fn clawback_eligible(option: &OptionRecord, wallet_ph: Option<Bytes32>, now: u64) -> bool {
     option.terms_known
         && !option.underlying_reclaimed
+        && option.phase != Phase::Superseded
         && option.nft_launcher_id.is_some()
         && now >= option.expiration_seconds
         && wallet_ph.is_some()
@@ -2632,6 +2884,7 @@ fn emit_status_json(state: &State, nfts: &[NftView], options: &[OptionView]) {
                 "state": user.machine(),
                 "on_chain": status.label(),
                 "terms_known": option.terms_known,
+                "kind": option.kind.label(),
                 "strike_mojos": option.strike_amount,
                 "expiration_seconds": option.expiration_seconds,
                 "expired": expired,

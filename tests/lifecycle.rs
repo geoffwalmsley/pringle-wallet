@@ -7,14 +7,16 @@ use anyhow::Result;
 use chia_wallet_sdk::chia::puzzle_types::nft::NftMetadata;
 use chia_wallet_sdk::driver::{decode_offer, encode_offer, P2SingletonLayer};
 use chia_wallet_sdk::prelude::{
-    Coin, Conditions, Offer, OptionType, Simulator, SpendBundle, SpendContext, StandardLayer,
+    Bytes32, Coin, Conditions, Offer, OptionType, OptionUnderlying, Simulator, SpendBundle,
+    SpendContext, StandardLayer, ToTreeHash,
 };
 use chia_wallet_sdk::test::sign_transaction;
 
 use pringle_wallet::nft;
 use pringle_wallet::option;
 use pringle_wallet::p2_singleton;
-use pringle_wallet::state::Phase;
+use pringle_wallet::state::{OptionKind, Phase};
+use pringle_wallet::sweep_option::{self, SweepTerms};
 use pringle_wallet::wallet::{build_send, select_for, spend_all};
 
 /// Helper: the deterministic wallet change coin produced by spending `parent`.
@@ -208,10 +210,12 @@ fn nft_mint_fund_and_option_mint() -> Result<()> {
         expiration,
         wallet_ph,
         wallet_ph,
+        OptionKind::Transfer,
         Phase::Pending,
     );
     assert_eq!(option_record.strike_amount, strike);
     assert_eq!(option_record.expiration_seconds, expiration);
+    assert_eq!(option_record.kind, OptionKind::Transfer);
 
     Ok(())
 }
@@ -258,6 +262,7 @@ fn option_offer_roundtrip_and_take() -> Result<()> {
         expiration,
         wallet_ph,
         wallet_ph,
+        OptionKind::Transfer,
         Phase::Confirmed,
     );
     let contract = option::option_from_record(&record)?;
@@ -385,6 +390,7 @@ fn option_exercise_returns_nft() -> Result<()> {
         expiration,
         wallet_ph,
         wallet_ph,
+        OptionKind::Transfer,
         Phase::Confirmed,
     );
     let nft_record = nft::nft_to_record(&outcome.locked_nft, &metadata, Phase::Superseded);
@@ -866,6 +872,367 @@ fn insufficient_funds_is_rejected() {
         10,
     );
     assert!(select_for(vec![coin], 1_000, 100).is_err());
+}
+
+/// A sweep option ready to exercise: the locked option outcome, the NFT metadata (to rebuild
+/// the locked NFT), and the funded p2_singleton coins.
+struct SweepFixture {
+    launcher_id: Bytes32,
+    outcome: option::OptionOutcome,
+    metadata: NftMetadata,
+    p2_coins: Vec<Coin>,
+}
+
+/// Mints an NFT, funds its p2_singleton with two coins, and creates a sweep option on it.
+/// All the setup spends are signed with `alice` (the creator) and confirmed.
+fn setup_sweep_option(
+    sim: &mut Simulator,
+    ctx: &mut SpendContext,
+    alice: &chia_wallet_sdk::prelude::BlsPairWithCoin,
+    creator_ph: Bytes32,
+    owner_ph: Bytes32,
+    strike: u64,
+    expiration: u64,
+) -> Result<SweepFixture> {
+    let alice_layer = StandardLayer::new(alice.pk);
+
+    let mint_selection = select_for(vec![alice.coin], nft::NFT_MINT_OUTPUT_VALUE, 0)?;
+    let metadata = NftMetadata::default();
+    let minted = nft::build_mint(
+        ctx,
+        &alice_layer,
+        creator_ph,
+        &mint_selection,
+        &metadata,
+        0,
+        0,
+    )?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+    let launcher_id = minted.info.launcher_id;
+    let after_mint = change_coin(alice.coin, creator_ph, mint_selection.change);
+
+    let fund1 = select_for(vec![after_mint], 100_000, 0)?;
+    let p2_coin1 = p2_singleton::build_fund(
+        ctx,
+        &alice_layer,
+        launcher_id,
+        100_000,
+        &fund1,
+        creator_ph,
+        0,
+    )?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+    let after_fund1 = change_coin(after_mint, creator_ph, fund1.change);
+
+    let fund2 = select_for(vec![after_fund1], 50_000, 0)?;
+    let p2_coin2 = p2_singleton::build_fund(
+        ctx,
+        &alice_layer,
+        launcher_id,
+        50_000,
+        &fund2,
+        creator_ph,
+        0,
+    )?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+    let after_fund2 = change_coin(after_fund1, creator_ph, fund2.change);
+
+    let option_selection = select_for(vec![after_fund2], option::OPTION_OUTPUT_VALUE, 0)?;
+    let outcome = option::build_create_sweep(
+        ctx,
+        &alice_layer,
+        minted,
+        &option_selection,
+        strike,
+        expiration,
+        creator_ph,
+        owner_ph,
+        creator_ph,
+        0,
+    )?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+    Ok(SweepFixture {
+        launcher_id,
+        outcome,
+        metadata,
+        p2_coins: vec![p2_coin1, p2_coin2],
+    })
+}
+
+#[test]
+fn sweep_option_full_lifecycle() -> Result<()> {
+    // Creator (alice) mints an NFT and sells a SWEEP option to holder (bob). On exercise the
+    // holder pays the strike and takes the p2_singleton income, while the NFT returns to the
+    // creator — the opposite of a transfer option.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let alice = sim.bls(1_000_000); // creator
+    let bob = sim.bls(1_000_000); // holder / owner
+    let bob_layer = StandardLayer::new(bob.pk);
+    let creator_ph = alice.puzzle_hash;
+    let holder_ph = bob.puzzle_hash;
+
+    let strike = 1_000u64;
+    let expiration = 4_000_000_000u64; // far future
+    let fx = setup_sweep_option(
+        &mut sim, ctx, &alice, creator_ph, holder_ph, strike, expiration,
+    )?;
+
+    assert!(sim.coin_state(fx.outcome.option.coin.coin_id()).is_some());
+    // The NFT is locked into the underlying (neither the creator's nor the holder's puzzle).
+    assert_ne!(fx.outcome.locked_nft.info.p2_puzzle_hash, creator_ph);
+    assert_ne!(fx.outcome.locked_nft.info.p2_puzzle_hash, holder_ph);
+
+    // Reconstruct the option (owner = bob) and the locked NFT from persisted records.
+    let option_record = option::option_to_record(
+        &fx.outcome,
+        strike,
+        expiration,
+        creator_ph,
+        holder_ph,
+        OptionKind::Sweep,
+        Phase::Confirmed,
+    );
+    assert_eq!(option_record.kind, OptionKind::Sweep);
+    let contract = option::option_from_record(&option_record)?;
+    let nft_record = nft::nft_to_record(&fx.outcome.locked_nft, &fx.metadata, Phase::Superseded);
+    let locked_nft = nft::nft_from_record(ctx, &nft_record)?;
+
+    // Bob exercises: strike funded from bob's coin, income paid to bob, NFT back to creator.
+    let strike_selection = select_for(vec![bob.coin], strike, 0)?;
+    let exercise = option::build_sweep_exercise(
+        ctx,
+        &bob_layer,
+        contract,
+        locked_nft,
+        creator_ph,
+        expiration,
+        strike,
+        holder_ph,
+        &fx.p2_coins,
+        &strike_selection,
+        holder_ph,
+        0,
+        Conditions::new(),
+    )?;
+    assert_eq!(exercise.total_swept, 150_000);
+    assert_eq!(exercise.swept_amount, 150_000);
+    assert_eq!(exercise.coins_swept, 2);
+    assert_eq!(exercise.odd_donation, 0);
+    // The NFT returns to the creator (same launcher), NOT to the holder.
+    assert_eq!(exercise.returned_nft.info.p2_puzzle_hash, creator_ph);
+    assert_eq!(exercise.returned_nft.info.launcher_id, fx.launcher_id);
+
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&bob.sk))?;
+
+    // The option was melted and the locked NFT and both p2 coins were consumed.
+    assert!(sim
+        .coin_state(fx.outcome.option.coin.coin_id())
+        .unwrap()
+        .spent_height
+        .is_some());
+    assert!(sim
+        .coin_state(fx.outcome.locked_nft.coin.coin_id())
+        .unwrap()
+        .spent_height
+        .is_some());
+    for coin in &fx.p2_coins {
+        assert!(sim
+            .coin_state(coin.coin_id())
+            .unwrap()
+            .spent_height
+            .is_some());
+    }
+
+    // The income landed in a single coin the holder controls.
+    let payout = sim
+        .coin_state(exercise.payout_coin.coin_id())
+        .expect("payout coin exists");
+    assert!(payout.spent_height.is_none());
+    assert_eq!(payout.coin.amount, 150_000);
+    assert_eq!(payout.coin.puzzle_hash, holder_ph);
+
+    // The NFT is live again under the creator, unspent.
+    let returned = sim
+        .coin_state(exercise.returned_nft.coin.coin_id())
+        .expect("returned nft exists");
+    assert!(returned.spent_height.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn sweep_exercise_rejects_second_odd_output() -> Result<()> {
+    // The singleton layer permits exactly one odd output (the NFT forced back to the creator).
+    // A holder who tries to append a second odd CREATE_COIN (to grab the NFT) is rejected.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let alice = sim.bls(1_000_000);
+    let alice_layer = StandardLayer::new(alice.pk);
+    let wallet_ph = alice.puzzle_hash;
+
+    let strike = 1_000u64;
+    let expiration = 4_000_000_000u64;
+    let fx = setup_sweep_option(
+        &mut sim, ctx, &alice, wallet_ph, wallet_ph, strike, expiration,
+    )?;
+
+    let option_record = option::option_to_record(
+        &fx.outcome,
+        strike,
+        expiration,
+        wallet_ph,
+        wallet_ph,
+        OptionKind::Sweep,
+        Phase::Confirmed,
+    );
+    let contract = option::option_from_record(&option_record)?;
+    let nft_record = nft::nft_to_record(&fx.outcome.locked_nft, &fx.metadata, Phase::Superseded);
+    let locked_nft = nft::nft_from_record(ctx, &nft_record)?;
+
+    // Malicious extra tail: a second odd CREATE_COIN attempting to seize the NFT.
+    let attacker_ph = Bytes32::new([9u8; 32]);
+    let malicious = Conditions::new().create_coin(
+        attacker_ph,
+        1,
+        chia_wallet_sdk::chia::puzzle_types::Memos::None,
+    );
+
+    let strike_selection = select_for(vec![alice.coin], strike, 0)?;
+    let _exercise = option::build_sweep_exercise(
+        ctx,
+        &alice_layer,
+        contract,
+        locked_nft,
+        wallet_ph,
+        expiration,
+        strike,
+        wallet_ph,
+        &fx.p2_coins,
+        &strike_selection,
+        wallet_ph,
+        0,
+        malicious,
+    )?;
+
+    let result = sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk));
+    assert!(
+        result.is_err(),
+        "a second odd CREATE_COIN must be rejected: the NFT cannot be redirected or melted"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn sweep_option_clawback_after_expiry() -> Result<()> {
+    // A sweep option's NFT lock is identical to a transfer option's, so an unexercised sweep
+    // option's underlying NFT can still be clawed back by the creator after expiry.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let alice = sim.bls(1_000_000);
+    let alice_layer = StandardLayer::new(alice.pk);
+    let wallet_ph = alice.puzzle_hash;
+
+    let strike = 1_000u64;
+    let expiration = 2_000u64;
+    let fx = setup_sweep_option(
+        &mut sim, ctx, &alice, wallet_ph, wallet_ph, strike, expiration,
+    )?;
+
+    sim.set_next_timestamp(expiration + 1)?;
+    let clawback = option::build_clawback(
+        ctx,
+        &alice_layer,
+        fx.outcome.launcher_id,
+        fx.outcome.locked_nft,
+        wallet_ph,
+        expiration,
+        strike,
+        wallet_ph,
+        None,
+        wallet_ph,
+        0,
+    )?;
+    assert_eq!(clawback.nft.info.p2_puzzle_hash, wallet_ph);
+    assert_eq!(clawback.nft.info.launcher_id, fx.launcher_id);
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+    assert!(sim
+        .coin_state(fx.outcome.locked_nft.coin.coin_id())
+        .unwrap()
+        .spent_height
+        .is_some());
+    assert!(sim
+        .coin_state(clawback.nft.coin.coin_id())
+        .expect("reclaimed nft exists")
+        .spent_height
+        .is_none());
+
+    Ok(())
+}
+
+#[test]
+fn sweep_and_transfer_share_lock_but_differ_in_delegated_hash() -> Result<()> {
+    // For identical terms, the two kinds lock the NFT into the *same* underlying puzzle but
+    // commit to *different* delegated puzzle hashes — the single 32-byte difference between
+    // them — and each verify function accepts only its own kind.
+    let ctx = &mut SpendContext::new();
+
+    let launcher_id = Bytes32::new([42u8; 32]);
+    let creator = Bytes32::new([7u8; 32]);
+    let expiration = 4_000_000_000u64;
+    let amount = 1u64;
+    let strike = 1_000u64;
+    let strike_type = OptionType::Xch { amount: strike };
+
+    let transfer_underlying =
+        OptionUnderlying::new(launcher_id, creator, expiration, amount, strike_type);
+    let terms = SweepTerms {
+        launcher_id,
+        creator_puzzle_hash: creator,
+        expiration_seconds: expiration,
+        underlying_amount: amount,
+        strike_amount: strike,
+    };
+    let sweep_underlying = terms.underlying();
+
+    // Same lock puzzle: the merkle tree ignores the delegated puzzle.
+    assert_eq!(
+        transfer_underlying.tree_hash(),
+        sweep_underlying.tree_hash()
+    );
+
+    // Different delegated puzzle hashes.
+    let transfer_deleg: Bytes32 = transfer_underlying.delegated_puzzle().tree_hash().into();
+    let sweep_deleg = sweep_option::delegated_puzzle_hash(ctx, &terms)?;
+    assert_ne!(transfer_deleg, sweep_deleg);
+
+    // Each verify accepts only the matching kind.
+    assert!(option::verify_terms(
+        launcher_id,
+        creator,
+        expiration,
+        amount,
+        strike_type,
+        transfer_deleg
+    ));
+    assert!(!option::verify_terms(
+        launcher_id,
+        creator,
+        expiration,
+        amount,
+        strike_type,
+        sweep_deleg
+    ));
+    assert!(sweep_option::verify_sweep_terms(&terms, sweep_deleg));
+    assert!(!sweep_option::verify_sweep_terms(&terms, transfer_deleg));
+
+    Ok(())
 }
 
 #[test]

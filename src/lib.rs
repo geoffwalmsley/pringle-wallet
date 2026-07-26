@@ -20,6 +20,7 @@ pub mod potato;
 pub mod signing;
 pub mod state;
 pub mod status_view;
+pub mod sweep_option;
 pub mod sync;
 pub mod wallet;
 

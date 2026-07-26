@@ -14,7 +14,8 @@ use crate::nft;
 use crate::option as option_contract;
 use crate::output::AppError;
 use crate::p2_singleton;
-use crate::state::{NftRecord, Phase};
+use crate::state::{NftRecord, OptionKind, Phase};
+use crate::sweep_option::{self, SweepTerms};
 
 /// An option's verified terms and underlying, read from the chain.
 #[derive(Debug, Clone)]
@@ -25,6 +26,8 @@ pub struct OptionDetails {
     pub expiration_seconds: u64,
     /// The puzzle hash that receives the strike payment.
     pub creator_puzzle_hash: Bytes32,
+    /// What exercising this option does, proven against the on-chain contract.
+    pub kind: OptionKind,
     /// The live underlying NFT coin, still locked in the option underlying puzzle.
     pub underlying_coin: Coin,
     /// The reconstructed underlying NFT (launcher id, metadata, proof).
@@ -93,25 +96,43 @@ pub async fn recover_option_details(
         nft::nft_record_from_parent_spend(&underlying_parent_spend, Phase::Superseded)?
             .ok_or_else(|| AppError::recoverable("could not reconstruct the underlying NFT"))?;
 
-    // 4. Only trust the terms once they reproduce the on-chain delegated puzzle hash.
-    if !option_contract::verify_terms(
+    // 4. Only trust the terms once they reproduce the on-chain delegated puzzle hash. The
+    //    delegated puzzle hash also *proves* which kind of option this is: the transfer and
+    //    sweep constructions produce different hashes from the same terms, so a match against
+    //    one and not the other is an unforgeable fact about the option's behavior.
+    let is_transfer = option_contract::verify_terms(
         launcher_id,
         creator,
         terms.expiration_seconds,
         underlying_record.coin.amount,
         terms.strike_type,
         underlying_delegated_puzzle_hash,
-    ) {
-        return Err(AppError::recoverable(
-            "recovered option terms failed verification against the on-chain contract",
-        )
-        .into());
-    }
+    );
+    let sweep_terms = SweepTerms {
+        launcher_id,
+        creator_puzzle_hash: creator,
+        expiration_seconds: terms.expiration_seconds,
+        underlying_amount: underlying_record.coin.amount,
+        strike_amount,
+    };
+    let is_sweep = sweep_option::verify_sweep_terms(&sweep_terms, underlying_delegated_puzzle_hash);
+
+    let kind = match (is_transfer, is_sweep) {
+        (true, false) => OptionKind::Transfer,
+        (false, true) => OptionKind::Sweep,
+        _ => {
+            return Err(AppError::recoverable(
+                "recovered option terms failed verification against the on-chain contract",
+            )
+            .into());
+        }
+    };
 
     Ok(OptionDetails {
         strike_amount,
         expiration_seconds: terms.expiration_seconds,
         creator_puzzle_hash: creator,
+        kind,
         underlying_coin: underlying_record.coin,
         underlying_nft,
     })
