@@ -367,6 +367,63 @@ pub fn finalize_offer(
     Ok(offer.to_spend_bundle(ctx)?)
 }
 
+/// The single option an offer sells, together with the XCH it asks for.
+///
+/// An offer file carries the option's identity and its link to the underlying, but not its
+/// terms (strike, expiration, creator) — those live on-chain and have to be looked up.
+#[derive(Debug, Clone, Copy)]
+pub struct OfferedOption {
+    /// The offered option's launcher id.
+    pub launcher_id: Bytes32,
+    /// The option coin as it sits inside the offer, locked at the settlement puzzle.
+    pub settlement_coin: Coin,
+    /// The maker's option coin that settles the offer. It must still be unspent, otherwise
+    /// the offer has already been taken (or cancelled by spending it another way).
+    pub maker_coin_id: Bytes32,
+    /// The coin id of the underlying the option is bound to.
+    pub underlying_coin_id: Bytes32,
+    /// The tree hash of the underlying delegated puzzle, which commits to the option terms.
+    pub underlying_delegated_puzzle_hash: Bytes32,
+    /// The XCH (in mojos) the maker asks for.
+    pub request_mojos: u64,
+}
+
+/// Extracts the option an offer sells, rejecting offers this CLI cannot handle.
+///
+/// Only "one option for XCH" offers are supported: anything else (CATs, NFTs, several
+/// options) is rejected here rather than partway through building a spend.
+pub fn offered_option(offer: &Offer) -> Result<OfferedOption> {
+    let requested = offer.requested_payments();
+    if !requested.cats.is_empty() || !requested.nfts.is_empty() || !requested.options.is_empty() {
+        anyhow::bail!("offer requests non-XCH assets, which this CLI cannot provide");
+    }
+    let request_mojos = requested.amounts().xch;
+    if request_mojos == 0 {
+        anyhow::bail!("offer does not request any XCH");
+    }
+
+    let offered = offer.offered_coins();
+    if !offered.xch.is_empty() || !offered.cats.is_empty() || !offered.nfts.is_empty() {
+        anyhow::bail!("offer includes non-option assets, which this CLI cannot receive");
+    }
+    if offered.options.len() != 1 {
+        anyhow::bail!(
+            "expected exactly one offered option, found {}",
+            offered.options.len()
+        );
+    }
+    let (&launcher_id, option) = offered.options.iter().next().expect("one option");
+
+    Ok(OfferedOption {
+        launcher_id,
+        settlement_coin: option.coin,
+        maker_coin_id: option.coin.parent_coin_info,
+        underlying_coin_id: option.info.underlying_coin_id,
+        underlying_delegated_puzzle_hash: option.info.underlying_delegated_puzzle_hash,
+        request_mojos,
+    })
+}
+
 /// The result of taking (accepting) an option offer.
 #[derive(Debug, Clone)]
 pub struct TakeOutcome {
@@ -394,34 +451,19 @@ pub fn build_take(
     taker_synthetic_pk: PublicKey,
     fee: u64,
 ) -> Result<TakeOutcome> {
-    let requested = offer.requested_payments();
-    if !requested.cats.is_empty() || !requested.nfts.is_empty() || !requested.options.is_empty() {
-        anyhow::bail!("offer requests non-XCH assets, which this CLI cannot provide");
-    }
-    let request = requested.amounts().xch;
-    if request == 0 {
-        anyhow::bail!("offer does not request any XCH");
-    }
-
-    let offered = offer.offered_coins();
-    if !offered.xch.is_empty() || !offered.cats.is_empty() || !offered.nfts.is_empty() {
-        anyhow::bail!("offer includes non-option assets, which this CLI cannot receive");
-    }
-    if offered.options.len() != 1 {
-        anyhow::bail!(
-            "expected exactly one offered option, found {}",
-            offered.options.len()
-        );
-    }
-    let (&launcher_id, _) = offered.options.iter().next().expect("one option");
+    let OfferedOption {
+        launcher_id,
+        request_mojos,
+        ..
+    } = offered_option(offer)?;
 
     let mut spends = Spends::new(taker_puzzle_hash);
-    spends.add(offered.clone());
+    spends.add(offer.offered_coins().clone());
     for &coin in source_coins {
         spends.add(coin);
     }
 
-    let mut actions = requested.actions();
+    let mut actions = offer.requested_payments().actions();
     if fee > 0 {
         actions.push(Action::fee(fee));
     }
@@ -442,7 +484,7 @@ pub fn build_take(
     Ok(TakeOutcome {
         option,
         launcher_id,
-        paid_mojos: request,
+        paid_mojos: request_mojos,
     })
 }
 

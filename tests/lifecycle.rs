@@ -7,7 +7,7 @@ use anyhow::Result;
 use chia_wallet_sdk::chia::puzzle_types::nft::NftMetadata;
 use chia_wallet_sdk::driver::{decode_offer, encode_offer, P2SingletonLayer};
 use chia_wallet_sdk::prelude::{
-    Coin, Conditions, Offer, Simulator, SpendBundle, SpendContext, StandardLayer,
+    Coin, Conditions, Offer, OptionType, Simulator, SpendBundle, SpendContext, StandardLayer,
 };
 use chia_wallet_sdk::test::sign_transaction;
 
@@ -15,7 +15,7 @@ use pringle_wallet::nft;
 use pringle_wallet::option;
 use pringle_wallet::p2_singleton;
 use pringle_wallet::state::Phase;
-use pringle_wallet::wallet::{select_for, spend_all};
+use pringle_wallet::wallet::{build_send, select_for, spend_all};
 
 /// Helper: the deterministic wallet change coin produced by spending `parent`.
 fn change_coin(
@@ -71,6 +71,45 @@ fn standard_wallet_consolidates_and_sends_all_coins() -> Result<()> {
         sim.coin_state(coin.coin_id())
             .is_some_and(|state| state.spent_height.is_some())
     }));
+    Ok(())
+}
+
+#[test]
+fn standard_wallet_sends_an_amount_and_keeps_the_change() -> Result<()> {
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+    let alice = sim.bls(1_000_000);
+    let layer = StandardLayer::new(alice.pk);
+
+    let destination = chia_wallet_sdk::prelude::Bytes32::new([7; 32]);
+    let selection = select_for(vec![alice.coin], 600_000, 1_000)?;
+    let outcome = build_send(
+        ctx,
+        &layer,
+        &selection,
+        destination,
+        600_000,
+        alice.puzzle_hash,
+        1_000,
+    )?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))?;
+
+    // The destination receives exactly the requested amount, and the fee comes out of what
+    // is left rather than out of the payment.
+    let paid = sim
+        .coin_state(outcome.output_coin.coin_id())
+        .expect("destination coin exists");
+    assert_eq!(paid.coin.amount, 600_000);
+    assert_eq!(paid.coin.puzzle_hash, destination);
+
+    let change = outcome.change_coin.expect("change was left over");
+    assert_eq!(change.amount, 399_000);
+    assert!(sim.coin_state(change.coin_id()).is_some());
+    assert!(sim
+        .coin_state(alice.coin.coin_id())
+        .expect("input coin exists")
+        .spent_height
+        .is_some());
     Ok(())
 }
 
@@ -244,6 +283,37 @@ fn option_offer_roundtrip_and_take() -> Result<()> {
         .options
         .contains_key(&outcome.launcher_id));
     assert_eq!(offer.requested_payments().amounts().xch, request);
+
+    // ---- The offer summary the CLI inspects before buying. ----
+    let offered = option::offered_option(&offer)?;
+    assert_eq!(offered.launcher_id, outcome.launcher_id);
+    assert_eq!(offered.request_mojos, request);
+    // The maker's option coin has to stay unspent for the offer to settle.
+    assert_eq!(offered.maker_coin_id, outcome.option.coin.coin_id());
+    assert_eq!(
+        offered.underlying_coin_id,
+        outcome.locked_nft.coin.coin_id()
+    );
+
+    // Terms are not carried in the offer, but the offer commits to them: only the real
+    // strike and expiration reproduce the underlying's delegated puzzle hash, which is what
+    // makes chain-recovered terms trustworthy enough to show a buyer.
+    assert!(option::verify_terms(
+        offered.launcher_id,
+        wallet_ph,
+        expiration,
+        outcome.locked_nft.coin.amount,
+        OptionType::Xch { amount: strike },
+        offered.underlying_delegated_puzzle_hash,
+    ));
+    assert!(!option::verify_terms(
+        offered.launcher_id,
+        wallet_ph,
+        expiration,
+        outcome.locked_nft.coin.amount,
+        OptionType::Xch { amount: strike - 1 },
+        offered.underlying_delegated_puzzle_hash,
+    ));
 
     // ---- Taker (bob) accepts via the same builder the CLI uses. ----
     let bob = sim.bls(request);

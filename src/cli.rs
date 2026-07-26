@@ -108,11 +108,21 @@ pub enum XchCommand {
         #[arg(long, default_value_t = 0)]
         fee: u64,
     },
-    /// Send the entire spendable standard-wallet XCH balance to an address.
-    SendAll {
+    /// Send XCH to an address.
+    ///
+    /// Pass `--amount` to send a specific number of mojos (the fee is paid on top, out of
+    /// the change), or `--all` to send the entire spendable balance minus the fee. Funds at
+    /// p2 singleton addresses are separate and are never included.
+    Send {
         /// Destination mainnet XCH address.
         address: String,
-        /// Transaction fee in mojos (deducted from the sent amount).
+        /// Amount to send, in mojos.
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        amount: Option<u64>,
+        /// Send the entire spendable balance, minus the fee.
+        #[arg(long)]
+        all: bool,
+        /// Transaction fee in mojos (paid from the change, or from the balance with `--all`).
         #[arg(long, default_value_t = 0)]
         fee: u64,
     },
@@ -203,6 +213,22 @@ pub enum OptionCommand {
         /// Which option to sell, by launcher id (required only when several are tracked).
         #[arg(long)]
         launcher: Option<String>,
+    },
+    /// Inspect an option offer file: show what the option is worth, then ask whether to
+    /// take it.
+    ///
+    /// Looks the option up on the chain and reports its verified terms (strike, expiration,
+    /// creator), the underlying NFT, and the income currently held in that NFT's p2
+    /// singleton — the balance the option's holder receives on exercise. Nothing is spent
+    /// unless you accept the prompt, which only appears when the offer is live and the
+    /// wallet can afford the asking price. A non-interactive run (or `--json`) reports and
+    /// stops; `--yes` buys without asking.
+    Inspect {
+        /// Path to the `.offer` file to inspect.
+        offer_file: PathBuf,
+        /// Transaction fee in mojos, if you accept the offer at the prompt.
+        #[arg(long, default_value_t = 0)]
+        fee: u64,
     },
     /// Accept an option offer file, paying the requested XCH to receive the option.
     Take {

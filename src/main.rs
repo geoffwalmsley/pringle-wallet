@@ -4,9 +4,7 @@ mod cli;
 
 use anyhow::{Context, Result};
 use chia_wallet_sdk::driver::{decode_offer, encode_offer};
-use chia_wallet_sdk::prelude::{
-    Address, Bytes32, Coin, Offer, OptionContract, OptionType, SpendContext,
-};
+use chia_wallet_sdk::prelude::{Address, Bytes32, Coin, Offer, OptionContract, SpendContext};
 use clap::Parser;
 use serde_json::{json, Value};
 
@@ -14,9 +12,10 @@ use pringle_wallet::chain::ChainStatus;
 use pringle_wallet::coinset::Coinset;
 use pringle_wallet::confirm::ActionPreview;
 use pringle_wallet::format;
+use pringle_wallet::inspect;
 use pringle_wallet::key::{self, Wallet};
 use pringle_wallet::nft;
-use pringle_wallet::option as option_contract;
+use pringle_wallet::option::{self as option_contract, OfferedOption};
 use pringle_wallet::output::{self, AppError, Report};
 use pringle_wallet::p2_singleton;
 use pringle_wallet::potato;
@@ -26,7 +25,7 @@ use pringle_wallet::state::{
 };
 use pringle_wallet::status_view;
 use pringle_wallet::sync;
-use pringle_wallet::wallet::{select_for, spend_all, Selection};
+use pringle_wallet::wallet::{build_send, select_for, spend_all, Selection};
 use pringle_wallet::MAINNET_PREFIX;
 
 use cli::{Cli, Command, NftCommand, OptionCommand, XchCommand};
@@ -59,11 +58,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
             XchCommand::Coins => cmd_coins(&key_file).await,
             XchCommand::Coin { coin_id } => cmd_coin(&coin_id).await,
             XchCommand::Consolidate { fee } => {
-                cmd_xch_spend_all(&key_file, &state_file, None, fee, yes).await
+                cmd_xch_consolidate(&key_file, &state_file, fee, yes).await
             }
-            XchCommand::SendAll { address, fee } => {
-                cmd_xch_spend_all(&key_file, &state_file, Some(address), fee, yes).await
-            }
+            XchCommand::Send {
+                address,
+                amount,
+                all,
+                fee,
+            } => cmd_xch_send(&key_file, &state_file, address, amount, all, fee, yes).await,
         },
         Command::Nft { command } => match command {
             NftCommand::Mint {
@@ -141,6 +143,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     launcher.as_deref(),
                 )
                 .await
+            }
+            OptionCommand::Inspect { offer_file, fee } => {
+                cmd_option_inspect(&key_file, &state_file, &offer_file, fee, yes).await
             }
             OptionCommand::Take { offer_file, fee } => {
                 cmd_option_take(&key_file, &state_file, &offer_file, fee, yes).await
@@ -376,25 +381,43 @@ async fn cmd_coins(key_file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Consolidates all standard-wallet coins, or sends their full value to another address.
+/// Fetches the coins a spend can draw on, refusing to continue when there are none.
 ///
 /// Pending transaction inputs recorded in local state are excluded to avoid accidental
 /// double-spend submissions. p2-singleton funds are at a different puzzle hash and are
 /// therefore never included.
-async fn cmd_xch_spend_all(
+async fn spendable_or_error(
+    coinset: &Coinset,
+    wallet: &Wallet,
+    state: &State,
+) -> Result<(Vec<Coin>, u64)> {
+    let coins = wallet_spendable_coins(coinset, wallet, state).await?;
+    if coins.is_empty() {
+        return Err(AppError::recoverable("wallet has no spendable XCH coins")
+            .why("the wallet is empty, or its coins are reserved by pending transactions")
+            .next("run `pringle status` to refresh pending transaction state")
+            .into());
+    }
+    let total = coins.iter().try_fold(0u64, |sum, coin| {
+        sum.checked_add(coin.amount)
+            .ok_or_else(|| anyhow::anyhow!("wallet balance overflows u64"))
+    })?;
+    Ok((coins, total))
+}
+
+/// Combines every spendable standard-wallet coin into a single wallet coin.
+async fn cmd_xch_consolidate(
     key_file: &Path,
     state_file: &Path,
-    destination_address: Option<String>,
     fee: u64,
     assume_yes: bool,
 ) -> Result<()> {
     let wallet = load_wallet(key_file)?;
     let mut state = State::load(state_file)?;
     let coinset = Coinset::mainnet();
-    let coins = wallet_spendable_coins(&coinset, &wallet, &state).await?;
+    let (coins, total) = spendable_or_error(&coinset, &wallet, &state).await?;
 
-    let is_consolidation = destination_address.is_none();
-    if is_consolidation && coins.len() == 1 {
+    if coins.len() == 1 {
         return Err(
             AppError::recoverable("wallet already has one spendable XCH coin")
                 .why("there is nothing to consolidate")
@@ -402,42 +425,14 @@ async fn cmd_xch_spend_all(
                 .into(),
         );
     }
-    if coins.is_empty() {
-        return Err(AppError::recoverable("wallet has no spendable XCH coins")
-            .why("the wallet is empty, or its coins are reserved by pending transactions")
-            .next("run `pringle status` to refresh pending transaction state")
-            .into());
-    }
+    let output = total_after_fee(total, fee)?;
 
-    let total = coins.iter().try_fold(0u64, |sum, coin| {
-        sum.checked_add(coin.amount)
-            .ok_or_else(|| anyhow::anyhow!("wallet balance overflows u64"))
-    })?;
-    let sent = total
-        .checked_sub(fee)
-        .filter(|amount| *amount > 0)
-        .ok_or_else(|| {
-            AppError::recoverable("fee must be less than the spendable XCH balance")
-                .why(format!("balance is {total} mojos and fee is {fee} mojos"))
-                .next("choose a smaller `--fee`")
-        })?;
-
-    let destination = match destination_address {
-        Some(address) => (parse_address(&address)?, address),
-        None => (wallet.puzzle_hash(), wallet.address()?),
-    };
-    let action = if is_consolidation {
-        "Consolidate XCH coins"
-    } else {
-        "Send full XCH balance"
-    };
-    let preview = ActionPreview::new(action)
+    let preview = ActionPreview::new("Consolidate XCH coins")
         .detail("Network", "mainnet")
         .detail("Input coins", coins.len().to_string())
         .detail("Balance", format::xch(total))
         .detail("Fee", format::xch(fee))
-        .detail("Destination", destination.1.clone())
-        .detail("Output", format::xch(sent));
+        .detail("Output", format::xch(output));
     if !confirm_or_abort(&preview, assume_yes)? {
         return Ok(());
     }
@@ -447,19 +442,14 @@ async fn cmd_xch_spend_all(
         &mut ctx,
         &wallet.standard_layer(),
         coins,
-        destination.0,
+        wallet.puzzle_hash(),
         fee,
     )?;
     let bundle = sign_spend_bundle(ctx.take(), &[wallet.synthetic_secret_key().clone()])?;
     coinset.push_tx(bundle).await?;
 
-    let kind = if is_consolidation {
-        "xch_consolidate"
-    } else {
-        "xch_send_all"
-    };
     state.transactions.push(TxRecord::new(
-        kind,
+        "xch_consolidate",
         outcome
             .spent_coins
             .iter()
@@ -469,14 +459,7 @@ async fn cmd_xch_spend_all(
     ));
     state.save(state_file)?;
 
-    let mut report = Report::new(
-        kind,
-        if is_consolidation {
-            "XCH consolidation submitted."
-        } else {
-            "Full-balance XCH send submitted."
-        },
-    );
+    let mut report = Report::new("xch_consolidate", "XCH consolidation submitted.");
     report
         .field_json(
             "Input coins",
@@ -497,10 +480,157 @@ async fn cmd_xch_spend_all(
             Value::from(outcome.sent),
         )
         .field_json("Fee", format::xch(fee), "fee_mojos", Value::from(fee))
-        .field("Destination", destination.1, "destination")
+        .field("Destination", wallet.address()?, "destination")
         .field(
             "Pending output coin",
             display_id(to_hex(outcome.output_coin.coin_id())),
+            "output_coin_id",
+        )
+        .note("Submitted to the mempool; run `pringle status` to check confirmation.");
+    report.emit();
+    Ok(())
+}
+
+/// What is left of `total` once `fee` is reserved, refusing a fee that swallows it whole.
+fn total_after_fee(total: u64, fee: u64) -> Result<u64> {
+    total
+        .checked_sub(fee)
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| {
+            AppError::recoverable("fee must be less than the spendable XCH balance")
+                .why(format!("balance is {total} mojos and fee is {fee} mojos"))
+                .next("choose a smaller `--fee`")
+                .into()
+        })
+}
+
+/// Sends XCH to an address: either a fixed `amount`, or the whole balance minus the fee.
+///
+/// A fixed amount is funded from just enough coins to cover it plus the fee, with the rest
+/// returned as change. `--all` spends every coin and takes the fee out of what is sent, so
+/// the wallet is left empty.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_xch_send(
+    key_file: &Path,
+    state_file: &Path,
+    address: String,
+    amount: Option<u64>,
+    all: bool,
+    fee: u64,
+    assume_yes: bool,
+) -> Result<()> {
+    let wallet = load_wallet(key_file)?;
+    let mut state = State::load(state_file)?;
+    let destination = parse_address(&address)?;
+    let coinset = Coinset::mainnet();
+    let (coins, total) = spendable_or_error(&coinset, &wallet, &state).await?;
+
+    // Work out what will be sent, and which coins pay for it, before asking to confirm: an
+    // unaffordable amount should be an error rather than a prompt the user has to decline.
+    // A `None` selection means "spend every coin", which is what `--all` does.
+    let (sent, selection) = match (amount, all) {
+        (Some(0), _) => {
+            return Err(AppError::recoverable("--amount must be greater than zero")
+                .next("use `--all` to send the whole balance")
+                .into())
+        }
+        (Some(amount), _) => {
+            let selection = select_for(coins.clone(), amount, fee).map_err(|err| {
+                AppError::recoverable(format!("cannot send {}: {err}", format::xch(amount)))
+                    .why(format!(
+                        "the wallet holds {} across {} spendable coin(s), and the fee is {}",
+                        format::xch(total),
+                        coins.len(),
+                        format::xch(fee)
+                    ))
+                    .next("lower --amount, or use --all to send everything")
+            })?;
+            (amount, Some(selection))
+        }
+        (None, true) => (total_after_fee(total, fee)?, None),
+        (None, false) => {
+            return Err(AppError::recoverable("no amount to send")
+                .next("pass `--amount <mojos>`, or `--all` to send the whole spendable balance")
+                .into())
+        }
+    };
+
+    let inputs = selection.as_ref().map_or(coins.len(), |s| s.coins.len());
+    let preview = ActionPreview::new("Send XCH")
+        .detail("Network", "mainnet")
+        .detail("Destination", address.clone())
+        .detail("Amount", format::xch(sent))
+        .detail("Fee", format::xch(fee))
+        .detail("Input coins", inputs.to_string())
+        .detail("Balance", format::xch(total));
+    if !confirm_or_abort(&preview, assume_yes)? {
+        return Ok(());
+    }
+
+    let mut ctx = SpendContext::new();
+    let layer = wallet.standard_layer();
+    let (output_coin, change, spent_coins) = match &selection {
+        Some(selection) => {
+            let outcome = build_send(
+                &mut ctx,
+                &layer,
+                selection,
+                destination,
+                sent,
+                wallet.puzzle_hash(),
+                fee,
+            )?;
+            (
+                outcome.output_coin,
+                selection.change,
+                outcome.spent_coins.clone(),
+            )
+        }
+        None => {
+            let outcome = spend_all(&mut ctx, &layer, coins, destination, fee)?;
+            (outcome.output_coin, 0, outcome.spent_coins)
+        }
+    };
+
+    let bundle = sign_spend_bundle(ctx.take(), &[wallet.synthetic_secret_key().clone()])?;
+    coinset.push_tx(bundle).await?;
+
+    state.transactions.push(TxRecord::new(
+        "xch_send",
+        spent_coins
+            .iter()
+            .map(|coin| to_hex(coin.coin_id()))
+            .collect(),
+        to_hex(output_coin.coin_id()),
+    ));
+    state.save(state_file)?;
+
+    let mut report = Report::new("xch_send", "XCH send submitted.");
+    report
+        .field_json(
+            "Amount",
+            format::xch(sent),
+            "amount_mojos",
+            Value::from(sent),
+        )
+        .primary()
+        .field_json("Fee", format::xch(fee), "fee_mojos", Value::from(fee))
+        .field("Destination", address, "destination")
+        .field_json(
+            "Input coins",
+            spent_coins.len().to_string(),
+            "input_count",
+            Value::from(spent_coins.len()),
+        )
+        .field_json(
+            "Change",
+            format::xch(change),
+            "change_mojos",
+            Value::from(change),
+        )
+        .field(
+            "Pending output coin",
+            display_id(to_hex(output_coin.coin_id())),
             "output_coin_id",
         )
         .note("Submitted to the mempool; run `pringle status` to check confirmation.");
@@ -1375,57 +1505,151 @@ async fn cmd_option_offer(
     Ok(())
 }
 
-async fn cmd_option_take(
-    key_file: &Path,
-    state_file: &Path,
-    offer_file: &Path,
-    fee: u64,
-    assume_yes: bool,
-) -> Result<()> {
-    let wallet = load_wallet(key_file)?;
-    let mut state = State::load(state_file)?;
-
+/// Reads an offer file and parses it against `ctx`, which must be the same context the
+/// offer is later spent through (notarized-payment memos resolve against its allocator).
+fn read_offer(ctx: &mut SpendContext, offer_file: &Path) -> Result<Offer> {
     let raw = std::fs::read_to_string(offer_file)
         .with_context(|| format!("failed to read offer file {}", offer_file.display()))?;
     let spend_bundle = decode_offer(raw.trim()).context("failed to decode offer file")?;
+    Ok(Offer::from_spend_bundle(ctx, &spend_bundle)?)
+}
 
-    let mut ctx = SpendContext::new();
-    let offer = Offer::from_spend_bundle(&mut ctx, &spend_bundle)?;
+/// Extracts the single option an offer sells, explaining the CLI's limits on failure.
+fn parse_offered_option(offer: &Offer) -> Result<OfferedOption> {
+    option_contract::offered_option(offer).map_err(|err| {
+        AppError::recoverable(err.to_string())
+            .why("this CLI only handles offers that sell one option for XCH")
+            .into()
+    })
+}
 
-    if offer.offered_coins().options.len() != 1 {
-        return Err(AppError::recoverable(
-            "this CLI can only take offers that offer exactly one option",
+/// Everything worth knowing about an offered option before paying for it.
+struct OfferInspection {
+    /// What the offer sells and asks for.
+    offered: OfferedOption,
+    /// Status of the maker's option coin. The offer can only settle while it is unspent.
+    offer_status: ChainStatus,
+    /// The option's chain-verified terms, or the reason they could not be established.
+    details: std::result::Result<inspect::OptionDetails, String>,
+    /// Income held by the underlying NFT's p2 singleton (looked up only with the terms).
+    p2: Option<inspect::P2SingletonBalance>,
+    /// The wallet coins available to pay with.
+    spendable: Vec<Coin>,
+    /// Their combined value.
+    spendable_mojos: u64,
+}
+
+impl OfferInspection {
+    /// The mojos still missing to cover the asking price plus `fee`, if any.
+    fn shortfall(&self, fee: u64) -> Option<u64> {
+        let needed = self.offered.request_mojos.saturating_add(fee);
+        needed.checked_sub(self.spendable_mojos).filter(|m| *m > 0)
+    }
+}
+
+/// Gathers the option's terms, its underlying's income, and the wallet's ability to pay.
+///
+/// The terms lookup is best-effort: an option that is not confirmed yet, or whose terms do
+/// not verify, is still worth reporting — just not worth buying.
+async fn inspect_offered_option(
+    coinset: &Coinset,
+    wallet: &Wallet,
+    state: &State,
+    offered: OfferedOption,
+) -> Result<OfferInspection> {
+    let offer_status = coinset.classify(offered.maker_coin_id).await;
+
+    let details = inspect::recover_option_details(
+        coinset,
+        offered.launcher_id,
+        offered.underlying_coin_id,
+        offered.underlying_delegated_puzzle_hash,
+    )
+    .await
+    .map_err(|err| err.to_string());
+
+    let p2 = match &details {
+        Ok(details) => {
+            let nft_launcher = from_hex(&details.underlying_nft.launcher_id)?;
+            Some(inspect::p2_singleton_balance(coinset, nft_launcher).await?)
+        }
+        Err(_) => None,
+    };
+
+    let spendable = wallet_spendable_coins(coinset, wallet, state).await?;
+    let spendable_mojos = spendable.iter().try_fold(0u64, |sum, coin| {
+        sum.checked_add(coin.amount)
+            .ok_or_else(|| anyhow::anyhow!("wallet balance overflows u64"))
+    })?;
+
+    Ok(OfferInspection {
+        offered,
+        offer_status,
+        details,
+        p2,
+        spendable,
+        spendable_mojos,
+    })
+}
+
+/// Requires the maker's option coin to still be spendable, so the offer can settle.
+fn require_live_offer(status: &ChainStatus) -> Result<()> {
+    match status {
+        ChainStatus::ConfirmedUnspent { .. } => Ok(()),
+        ChainStatus::NotFound => Err(AppError::recoverable(
+            "the offered option coin is not confirmed yet",
         )
-        .into());
+        .why("it has not appeared on-chain (still pending in the mempool)")
+        .next("wait a bit, then try again")
+        .into()),
+        ChainStatus::Spent { .. } => Err(AppError::recoverable(
+            "this offer can no longer be taken",
+        )
+        .why("the offered option coin has already been spent, so the offer was taken or cancelled")
+        .next("ask the maker for a fresh offer")
+        .into()),
+        ChainStatus::LookupFailed { error } => Err(AppError::chain(format!(
+            "could not look up the offered option coin: {error}"
+        ))
+        .next("check your network connection and retry")
+        .into()),
     }
-    let offered_option = *offer
-        .offered_coins()
-        .options
-        .values()
-        .next()
-        .expect("one option");
-    let request = offer.requested_payments().amounts().xch;
-    if request == 0 {
-        return Err(AppError::recoverable("offer does not request any XCH").into());
+}
+
+/// Builds the confirmation preview for taking an offer, including what is being bought.
+fn take_preview(inspection: &OfferInspection, fee: u64, receive_address: String) -> ActionPreview {
+    let mut preview = ActionPreview::new("Take option offer")
+        .detail("Pay", format::xch(inspection.offered.request_mojos))
+        .detail("Fee", format::xch(fee));
+    if let Ok(details) = &inspection.details {
+        preview = preview
+            .detail("Strike", format::xch(details.strike_amount))
+            .detail(
+                "Expiration",
+                format::expiration(details.expiration_seconds, now_seconds()),
+            );
     }
-
-    let coinset = Coinset::mainnet();
-    let maker_coin_id = offered_option.coin.parent_coin_info;
-    require_confirmed_unspent(&coinset, maker_coin_id, "offered option").await?;
-
-    let coins = wallet_spendable_coins(&coinset, &wallet, &state).await?;
-    let selection = select_for(coins, request, fee)?;
-
-    let preview = ActionPreview::new("Take option offer")
-        .detail("Pay", format::xch(request))
-        .detail("Fee", format::xch(fee))
-        .detail("Receive option to", wallet.address()?);
-    if !confirm_or_abort(&preview, assume_yes)? {
-        return Ok(());
+    if let Some(p2) = &inspection.p2 {
+        preview = preview.detail("Income held by NFT", format::xch(p2.total_mojos));
     }
+    preview.detail("Receive option to", receive_address)
+}
 
+/// Buys the offered option: settles the offer, records the purchase, and reports it.
+#[allow(clippy::too_many_arguments)]
+async fn execute_take(
+    coinset: &Coinset,
+    wallet: &Wallet,
+    state: &mut State,
+    state_file: &Path,
+    ctx: &mut SpendContext,
+    offer: Offer,
+    offered: &OfferedOption,
+    selection: &Selection,
+    fee: u64,
+) -> Result<()> {
     let outcome = option_contract::build_take(
-        &mut ctx,
+        ctx,
         &offer,
         &selection.coins,
         wallet.puzzle_hash(),
@@ -1437,8 +1661,8 @@ async fn cmd_option_take(
     let full_bundle = offer.take(signed);
     coinset.push_tx(full_bundle).await?;
 
-    let mut spent_ids = selection_spent_ids(&selection);
-    spent_ids.push(to_hex(maker_coin_id));
+    let mut spent_ids = selection_spent_ids(selection);
+    spent_ids.push(to_hex(offered.maker_coin_id));
     state.transactions.push(TxRecord::new(
         "option_take",
         spent_ids,
@@ -1455,7 +1679,7 @@ async fn cmd_option_take(
     // Best-effort: recover terms + underlying NFT from the chain. It may fail if the option
     // is not yet confirmed; the user can re-run `pringle option recover` later.
     let launcher_hex = to_hex(outcome.launcher_id);
-    let recovered = recover_option_terms(&coinset, &mut state, state_file, &launcher_hex)
+    let recovered = recover_option_terms(coinset, state, state_file, &launcher_hex)
         .await
         .is_ok();
 
@@ -1498,6 +1722,231 @@ async fn cmd_option_take(
     Ok(())
 }
 
+async fn cmd_option_take(
+    key_file: &Path,
+    state_file: &Path,
+    offer_file: &Path,
+    fee: u64,
+    assume_yes: bool,
+) -> Result<()> {
+    let wallet = load_wallet(key_file)?;
+    let mut state = State::load(state_file)?;
+
+    let mut ctx = SpendContext::new();
+    let offer = read_offer(&mut ctx, offer_file)?;
+    let offered = parse_offered_option(&offer)?;
+
+    let coinset = Coinset::mainnet();
+    let inspection = inspect_offered_option(&coinset, &wallet, &state, offered).await?;
+    require_live_offer(&inspection.offer_status)?;
+
+    let selection = select_for(inspection.spendable.clone(), offered.request_mojos, fee)?;
+
+    let preview = take_preview(&inspection, fee, wallet.address()?);
+    if !confirm_or_abort(&preview, assume_yes)? {
+        return Ok(());
+    }
+
+    execute_take(
+        &coinset, &wallet, &mut state, state_file, &mut ctx, offer, &offered, &selection, fee,
+    )
+    .await
+}
+
+/// Shows what an offered option is actually worth, then offers to buy it.
+///
+/// The offer file only names the option, so its terms and the income backing it are read
+/// from the chain. Nothing is spent unless the wallet can cover the asking price and the
+/// user accepts the prompt.
+async fn cmd_option_inspect(
+    key_file: &Path,
+    state_file: &Path,
+    offer_file: &Path,
+    fee: u64,
+    assume_yes: bool,
+) -> Result<()> {
+    let wallet = load_wallet(key_file)?;
+    let mut state = State::load(state_file)?;
+
+    let mut ctx = SpendContext::new();
+    let offer = read_offer(&mut ctx, offer_file)?;
+    let offered = parse_offered_option(&offer)?;
+
+    let coinset = Coinset::mainnet();
+    let inspection = inspect_offered_option(&coinset, &wallet, &state, offered).await?;
+    let shortfall = inspection.shortfall(fee);
+    emit_inspection_report(offer_file, &inspection, fee, shortfall);
+
+    // Only offer to buy something that is still for sale, understood, and affordable.
+    if !inspection.offer_status.is_confirmed_unspent()
+        || inspection.details.is_err()
+        || shortfall.is_some()
+        || output::is_json()
+    {
+        return Ok(());
+    }
+
+    let selection = select_for(inspection.spendable.clone(), offered.request_mojos, fee)?;
+    let preview = take_preview(&inspection, fee, wallet.address()?);
+    if !preview.confirm_opt_in(assume_yes)? {
+        output::progress("Not taken.");
+        return Ok(());
+    }
+
+    execute_take(
+        &coinset, &wallet, &mut state, state_file, &mut ctx, offer, &offered, &selection, fee,
+    )
+    .await
+}
+
+/// Reports an inspected offer: what it sells, what backs it, and whether it is affordable.
+fn emit_inspection_report(
+    offer_file: &Path,
+    inspection: &OfferInspection,
+    fee: u64,
+    shortfall: Option<u64>,
+) {
+    let offered = &inspection.offered;
+    let now = now_seconds();
+    let mut report = Report::new(
+        "option_inspect",
+        format!("Option offer in {}", offer_file.display()),
+    );
+
+    report
+        .field(
+            "Offer status",
+            inspection.offer_status.label(),
+            "offer_status",
+        )
+        .field(
+            "Option launcher",
+            display_id(to_hex(offered.launcher_id)),
+            "launcher_id",
+        )
+        .primary();
+
+    match &inspection.details {
+        Ok(details) => {
+            report
+                .field_json(
+                    "Strike",
+                    format::xch(details.strike_amount),
+                    "strike_mojos",
+                    Value::from(details.strike_amount),
+                )
+                .field_json(
+                    "Expiration",
+                    format::expiration(details.expiration_seconds, now),
+                    "expiration_seconds",
+                    Value::from(details.expiration_seconds),
+                )
+                .field(
+                    "Creator",
+                    display_id(to_hex(details.creator_puzzle_hash)),
+                    "creator_puzzle_hash",
+                )
+                .field(
+                    "Underlying NFT",
+                    display_id(details.underlying_nft.launcher_id.clone()),
+                    "nft_launcher_id",
+                );
+        }
+        Err(error) => {
+            report.field_json(
+                "Terms",
+                "unknown",
+                "terms_error",
+                Value::String(error.clone()),
+            );
+        }
+    }
+
+    if let Some(p2) = &inspection.p2 {
+        report
+            .field_json(
+                "Income held by NFT",
+                format!(
+                    "{} in {} coin(s)",
+                    format::xch(p2.total_mojos),
+                    p2.coins.len()
+                ),
+                "income_mojos",
+                Value::from(p2.total_mojos),
+            )
+            .json_only("income_coins", Value::from(p2.coins.len()))
+            .field("Income address", p2.address.clone(), "income_address");
+    }
+
+    report.field_json(
+        "Asking price",
+        format::xch(offered.request_mojos),
+        "request_mojos",
+        Value::from(offered.request_mojos),
+    );
+    if fee > 0 {
+        report.field_json("Fee", format::xch(fee), "fee_mojos", Value::from(fee));
+    }
+    report
+        .field_json(
+            "Your balance",
+            format::xch(inspection.spendable_mojos),
+            "spendable_mojos",
+            Value::from(inspection.spendable_mojos),
+        )
+        .json_only("affordable", Value::Bool(shortfall.is_none()));
+
+    // Spell out anything standing between the reader and a sound decision. An offer that
+    // cannot settle explains itself; there is no point also explaining why its terms are
+    // unreadable, since that is the same fact told twice.
+    match (&inspection.offer_status, &inspection.details) {
+        (ChainStatus::Spent { .. }, _) => {
+            report.note(
+                "The offered option coin has been spent, so this offer has already been taken\n\
+                 or cancelled and can no longer settle.",
+            );
+        }
+        (ChainStatus::NotFound, _) => {
+            report.note(
+                "The offered option coin is not on-chain yet, so the offer cannot settle until\n\
+                 it confirms.",
+            );
+        }
+        (ChainStatus::LookupFailed { error }, _) => {
+            report.note(format!(
+                "Could not check whether this offer is still live: {error}"
+            ));
+        }
+        (ChainStatus::ConfirmedUnspent { .. }, Err(error)) => {
+            report.note(format!(
+                "The option's terms could not be verified against the chain, so what this\n\
+                 option is worth is unknown: {error}"
+            ));
+        }
+        (ChainStatus::ConfirmedUnspent { .. }, Ok(details)) => {
+            if now >= details.expiration_seconds {
+                report.note(
+                    "This option has already expired: it can no longer be exercised, and its\n\
+                     creator can reclaim the underlying NFT at any time.",
+                );
+            }
+            match shortfall {
+                Some(missing) => report.note(format!(
+                    "Not enough XCH to take this offer: {} short.",
+                    format::xch(missing)
+                )),
+                None if output::is_json() => report.note(format!(
+                    "Affordable. Run `pringle option take {}` to accept it.",
+                    offer_file.display()
+                )),
+                None => &mut report,
+            };
+        }
+    }
+
+    report.emit();
+}
+
 /// Recovers a purchased option's terms (strike/expiration/creator) and locked underlying
 /// NFT from the chain, verifies them, and persists everything.
 async fn recover_option_terms(
@@ -1511,74 +1960,22 @@ async fn recover_option_terms(
         .cloned()
         .ok_or_else(|| AppError::recoverable("no such option"))?;
     let launcher_bytes = from_hex(&record.launcher_id)?;
-
-    // 1. Read the launcher metadata (expiration + strike type).
-    let launcher_spend = coinset.coin_spend(launcher_bytes).await?.ok_or_else(|| {
-        AppError::recoverable("option launcher coin has no recorded spend on-chain")
-            .why("the option may not be confirmed yet")
-            .next("wait for confirmation, then run `pringle option recover`")
-    })?;
-    let terms = option_contract::terms_from_launcher_spend(&launcher_spend)?;
-    let strike_amount = match terms.strike_type {
-        OptionType::Xch { amount } => amount,
-        _ => {
-            return Err(AppError::recoverable(
-                "this option has a non-XCH strike, which this CLI does not support",
-            )
-            .into())
-        }
-    };
-
-    // 2. Recover the creator puzzle hash from the launcher creation memo.
-    let launcher_record = coinset
-        .coin_record(launcher_bytes)
-        .await?
-        .ok_or_else(|| AppError::recoverable("option launcher coin not found on-chain"))?;
-    let launcher_parent = launcher_record.coin.parent_coin_info;
-    let parent_spend = coinset.coin_spend(launcher_parent).await?.ok_or_else(|| {
-        AppError::recoverable("could not fetch the launcher's parent spend to recover the creator")
-    })?;
-    let creator = option_contract::creator_from_launcher_creation(&parent_spend, launcher_bytes)?
-        .ok_or_else(|| {
-        AppError::recoverable("could not recover the option creator from the launcher memo")
-    })?;
-
-    // 3. Verify the recovered terms reproduce the on-chain delegated puzzle hash.
-    let underlying_delegated = from_hex(&record.underlying_delegated_puzzle_hash)?;
-    if !option_contract::verify_terms(
-        launcher_bytes,
-        creator,
-        terms.expiration_seconds,
-        1, // NFT underlying amount
-        terms.strike_type,
-        underlying_delegated,
-    ) {
-        return Err(AppError::recoverable(
-            "recovered option terms failed verification against the on-chain contract",
-        )
-        .into());
-    }
-
-    // 4. Reconstruct the locked underlying NFT from its parent spend.
     let underlying_coin_id = match &record.underlying_coin_id {
         Some(id) => from_hex(id)?,
         None => record.underlying_nft_coin.to_coin()?.coin_id(),
     };
-    let ul_record = coinset
-        .coin_record(underlying_coin_id)
-        .await?
-        .ok_or_else(|| AppError::recoverable("underlying NFT coin not found on-chain"))?;
-    let ul_parent_spend = coinset
-        .coin_spend(ul_record.coin.parent_coin_info)
-        .await?
-        .ok_or_else(|| {
-            AppError::recoverable("could not fetch the underlying NFT's parent spend")
-        })?;
-    let nft_record = nft::nft_record_from_parent_spend(&ul_parent_spend, Phase::Superseded)?
-        .ok_or_else(|| AppError::recoverable("could not reconstruct the underlying NFT"))?;
-    let nft_launcher = nft_record.launcher_id.clone();
+
+    let details = inspect::recover_option_details(
+        coinset,
+        launcher_bytes,
+        underlying_coin_id,
+        from_hex(&record.underlying_delegated_puzzle_hash)?,
+    )
+    .await?;
+
+    let nft_launcher = details.underlying_nft.launcher_id.clone();
     let nft_launcher_bytes = from_hex(&nft_launcher)?;
-    state.upsert_nft(nft_record);
+    state.upsert_nft(details.underlying_nft);
 
     // The recovered NFT deterministically controls a p2 singleton. Track it even when empty
     // so status/sync discovers funds that were attached before this wallet bought the option.
@@ -1590,12 +1987,12 @@ async fn recover_option_terms(
         )?);
     }
 
-    // 5. Persist the recovered terms and NFT relationship.
+    // Persist the recovered terms and NFT relationship.
     if let Some(rec) = state.option_mut(launcher_id) {
-        rec.strike_amount = strike_amount;
-        rec.expiration_seconds = terms.expiration_seconds;
-        rec.creator_puzzle_hash = to_hex(creator);
-        rec.underlying_nft_coin = CoinJson::from_coin(ul_record.coin);
+        rec.strike_amount = details.strike_amount;
+        rec.expiration_seconds = details.expiration_seconds;
+        rec.creator_puzzle_hash = to_hex(details.creator_puzzle_hash);
+        rec.underlying_nft_coin = CoinJson::from_coin(details.underlying_coin);
         rec.nft_launcher_id = Some(nft_launcher);
         rec.terms_known = true;
     }

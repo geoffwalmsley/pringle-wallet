@@ -58,6 +58,31 @@ impl ActionPreview {
         Ok(answer == "y" || answer == "yes")
     }
 
+    /// Asks whether to also perform an action the user did not ask for, returning
+    /// `Ok(true)` to proceed.
+    ///
+    /// This is the opposite default to [`ActionPreview::confirm`]: the action is an opt-in
+    /// follow-up to a read-only command, so silence means no. A non-interactive run
+    /// declines instead of proceeding, and only `--yes` (or an explicit "y") goes ahead.
+    pub fn confirm_opt_in(&self, assume_yes: bool) -> Result<bool> {
+        if assume_yes {
+            self.print_preview();
+            return Ok(true);
+        }
+        if !output::stderr_is_tty() {
+            return Ok(false);
+        }
+
+        self.print_preview();
+        eprint!("Proceed? [y/N] ");
+        std::io::stderr().flush().ok();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let answer = input.trim().to_lowercase();
+        Ok(answer == "y" || answer == "yes")
+    }
+
     fn print_preview(&self) {
         if output::is_quiet() || output::is_json() {
             return;
