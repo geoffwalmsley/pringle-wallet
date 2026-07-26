@@ -94,11 +94,14 @@ pringle xch address
 pringle xch coins
 pringle xch coin <coin-id>
 
-# Combine all spendable regular XCH coins into one wallet coin. To instead empty the
-# regular wallet, send the full spendable balance (minus the fee) to an xch address.
-# Funds at p2 singleton addresses are separate and are not included.
+# Combine all spendable regular XCH coins into one wallet coin.
 pringle xch consolidate --fee 100000
-pringle xch send-all xch1... --fee 100000
+
+# Send XCH to an address: a specific number of mojos (the fee is paid on top, out of the
+# change), or --all to empty the regular wallet by sending the balance minus the fee.
+# Funds at p2 singleton addresses are separate and are not included.
+pringle xch send xch1... --amount 250000000 --fee 100000
+pringle xch send xch1... --all --fee 100000
 
 # 3. Mint an NFT owned by the wallet (fee in mojos).
 pringle nft mint --fee 100000
@@ -121,6 +124,11 @@ pringle option create --strike 5000000000000 --expiration 1893456000 --fee 10000
 # 6a. Sell the option: write an offer, or accept one selling an option for XCH.
 pringle option offer --request 250000000 --output option.offer
 pringle option take option.offer --fee 100000
+
+# Received an offer? Inspect it before buying. This looks the option up on-chain and
+# reports its verified terms, its underlying NFT, and the income that NFT's p2 singleton
+# is currently holding, then asks whether to take it (see below).
+pringle option inspect received.offer --fee 100000
 
 # A purchased option's terms (strike/expiration/creator) aren't in the offer file; `take`
 # recovers them from the chain automatically. If the option wasn't confirmed yet, run:
@@ -148,6 +156,24 @@ pringle status --cached   # local snapshot only, no network
 # Reconcile local state with the chain (fixes stale coin ids after confirmations).
 pringle sync
 ```
+
+### Inspecting an offer before taking it
+
+An offer file names the option it sells but carries none of its terms, so `pringle option
+inspect` reads them back off the chain. It reports whether the offer can still settle (the
+maker's option coin must be unspent), the strike, expiration, and creator, the underlying
+NFT, and the balance held at that NFT's income address — the money that comes with the NFT
+when the option is exercised. The terms are only shown once they reproduce the option's
+on-chain `underlying_delegated_puzzle_hash`, so a reported strike or expiration is a fact
+about the contract rather than a claim by the maker.
+
+Nothing is spent by inspecting. When the offer is live, its terms verify, and the wallet
+holds enough XCH to cover the asking price plus `--fee`, the command finishes by asking
+whether to take it; answering `y` runs the same purchase as `pringle option take`. Unlike
+the confirmation prompts on destructive commands, this one defaults to *no*: a
+non-interactive run (or `--json`) prints the report and stops, so a script never buys an
+option by accident. `pringle option take` shows the same terms and income figures in its
+confirmation preview.
 
 ### Expired options
 

@@ -10,6 +10,7 @@ pub mod chain;
 pub mod coinset;
 pub mod confirm;
 pub mod format;
+pub mod inspect;
 pub mod key;
 pub mod nft;
 pub mod option;

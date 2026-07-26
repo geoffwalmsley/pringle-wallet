@@ -42,7 +42,44 @@ fn xch_help_lists_wallet_subcommands() {
         .stdout(predicate::str::contains("coins"))
         .stdout(predicate::str::contains("coin"))
         .stdout(predicate::str::contains("consolidate"))
-        .stdout(predicate::str::contains("send-all"));
+        .stdout(predicate::str::contains("send"));
+}
+
+#[test]
+fn xch_send_help_documents_amount_and_all() {
+    Command::cargo_bin("pringle")
+        .unwrap()
+        .args(["xch", "send", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--amount"))
+        .stdout(predicate::str::contains("--all"))
+        .stdout(predicate::str::contains("--fee"));
+}
+
+#[test]
+fn xch_send_requires_an_amount_or_all() {
+    let dir = tempdir().unwrap();
+    pringle(dir.path()).arg("init").assert().success();
+
+    // Clap rejects this before any key, state, or network access.
+    pringle(dir.path())
+        .args(["xch", "send", "xch1qqqqqq"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--amount"));
+}
+
+#[test]
+fn xch_send_rejects_amount_together_with_all() {
+    let dir = tempdir().unwrap();
+    pringle(dir.path()).arg("init").assert().success();
+
+    pringle(dir.path())
+        .args(["xch", "send", "xch1qqqqqq", "--amount", "1000", "--all"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]
@@ -67,6 +104,35 @@ fn option_show_all_help_exposes_history_and_cached_flags() {
         .success()
         .stdout(predicate::str::contains("--include-closed"))
         .stdout(predicate::str::contains("--cached"));
+}
+
+#[test]
+fn option_inspect_help_documents_the_lookup_and_prompt() {
+    Command::cargo_bin("pringle")
+        .unwrap()
+        .args(["option", "inspect", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--fee"))
+        .stdout(predicate::str::contains("p2"))
+        .stdout(predicate::str::contains("take"));
+}
+
+#[test]
+fn option_inspect_rejects_a_file_that_is_not_an_offer() {
+    let dir = tempdir().unwrap();
+    pringle(dir.path()).arg("init").assert().success();
+
+    let offer_file = dir.path().join("not.offer");
+    std::fs::write(&offer_file, "definitely not an offer\n").unwrap();
+
+    // Decoding fails before any network access, so this stays offline.
+    pringle(dir.path())
+        .args(["option", "inspect"])
+        .arg(&offer_file)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to decode offer file"));
 }
 
 #[test]

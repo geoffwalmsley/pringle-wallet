@@ -27,6 +27,19 @@ pub struct Selection {
     pub change: u64,
 }
 
+/// Result of sending a fixed amount to a destination, with the rest returned as change.
+#[derive(Debug, Clone)]
+pub struct SendOutcome {
+    /// The amount paid to the destination.
+    pub sent: u64,
+    /// The destination coin created by the spend.
+    pub output_coin: Coin,
+    /// The change coin returned to the wallet, if any was left over.
+    pub change_coin: Option<Coin>,
+    /// Input coins consumed by the spend.
+    pub spent_coins: Vec<Coin>,
+}
+
 /// Result of spending every supplied standard-wallet coin into one output.
 #[derive(Debug, Clone)]
 pub struct SpendAllOutcome {
@@ -103,6 +116,42 @@ pub fn spend_selection(
     Ok(())
 }
 
+/// Sends `amount` to `destination` from the selected coins, returning the change.
+///
+/// Unlike [`spend_all`], the fee is paid on top of the amount rather than out of it, so the
+/// destination receives exactly what was asked for. The selection must already cover
+/// `amount + fee` (see [`select_for`]).
+pub fn build_send(
+    ctx: &mut SpendContext,
+    layer: &StandardLayer,
+    selection: &Selection,
+    destination: Bytes32,
+    amount: u64,
+    change_puzzle_hash: Bytes32,
+    fee: u64,
+) -> Result<SendOutcome> {
+    if amount == 0 {
+        bail!("refusing to send zero mojos");
+    }
+    if selection.coins.is_empty() {
+        bail!("no coins selected to spend");
+    }
+
+    let primary = Conditions::new().create_coin(destination, amount, Memos::None);
+    spend_selection(ctx, layer, selection, primary, change_puzzle_hash, fee)?;
+
+    // Both outputs are created by the first selected coin, which is what `spend_selection`
+    // emits them from.
+    let parent = selection.coins[0].coin_id();
+    Ok(SendOutcome {
+        sent: amount,
+        output_coin: Coin::new(parent, destination, amount),
+        change_coin: (selection.change > 0)
+            .then(|| Coin::new(parent, change_puzzle_hash, selection.change)),
+        spent_coins: selection.coins.clone(),
+    })
+}
+
 /// Spends all supplied standard-wallet coins into one destination coin.
 ///
 /// This powers both consolidation (destination is the wallet itself) and send-all. The fee
@@ -167,6 +216,76 @@ mod tests {
     #[test]
     fn insufficient_balance_errors() {
         assert!(select_for(vec![coin(50)], 600, 100).is_err());
+    }
+
+    #[test]
+    fn send_pays_the_fee_on_top_and_returns_change() {
+        let mut ctx = SpendContext::new();
+        let layer = StandardLayer::new(
+            chia_wallet_sdk::chia::bls::SecretKey::from_seed(&[1; 32]).public_key(),
+        );
+        let change_ph = Bytes32::new([2; 32]);
+        let destination = Bytes32::new([3; 32]);
+
+        let selection = select_for(vec![coin(1_000)], 600, 25).unwrap();
+        let outcome = build_send(
+            &mut ctx,
+            &layer,
+            &selection,
+            destination,
+            600,
+            change_ph,
+            25,
+        )
+        .unwrap();
+
+        // The destination gets exactly the requested amount; the fee comes out of the change.
+        assert_eq!(outcome.sent, 600);
+        assert_eq!(outcome.output_coin.amount, 600);
+        assert_eq!(outcome.output_coin.puzzle_hash, destination);
+        assert_eq!(outcome.change_coin.unwrap().amount, 375);
+        assert_eq!(ctx.take().len(), 1);
+    }
+
+    #[test]
+    fn send_without_change_creates_no_change_coin() {
+        let mut ctx = SpendContext::new();
+        let layer = StandardLayer::new(
+            chia_wallet_sdk::chia::bls::SecretKey::from_seed(&[1; 32]).public_key(),
+        );
+        let change_ph = Bytes32::new([2; 32]);
+
+        let selection = select_for(vec![coin(1_000)], 975, 25).unwrap();
+        let outcome = build_send(
+            &mut ctx,
+            &layer,
+            &selection,
+            Bytes32::new([3; 32]),
+            975,
+            change_ph,
+            25,
+        )
+        .unwrap();
+
+        assert!(outcome.change_coin.is_none());
+    }
+
+    #[test]
+    fn send_rejects_zero_and_empty_selections() {
+        let mut ctx = SpendContext::new();
+        let layer = StandardLayer::new(
+            chia_wallet_sdk::chia::bls::SecretKey::from_seed(&[1; 32]).public_key(),
+        );
+        let destination = Bytes32::new([3; 32]);
+        let selection = select_for(vec![coin(1_000)], 600, 0).unwrap();
+        let empty = Selection {
+            coins: Vec::new(),
+            total: 0,
+            change: 0,
+        };
+
+        assert!(build_send(&mut ctx, &layer, &selection, destination, 0, destination, 0).is_err());
+        assert!(build_send(&mut ctx, &layer, &empty, destination, 600, destination, 0).is_err());
     }
 
     #[test]
