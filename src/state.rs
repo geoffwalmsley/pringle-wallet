@@ -60,6 +60,9 @@ pub struct State {
     /// The options tracked by this wallet (created or purchased).
     #[serde(default)]
     pub options: Vec<OptionRecord>,
+    /// Cached Pot Potato lineage, so `pringle potato` only reads the new part of the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub potato: Option<PotatoCache>,
 
     // ---- Legacy v1 single-asset fields (migrated on load, never re-serialized). ----
     #[serde(default, skip_serializing)]
@@ -81,6 +84,7 @@ impl Default for State {
             nfts: Vec::new(),
             p2_singletons: Vec::new(),
             options: Vec::new(),
+            potato: None,
             nft: None,
             p2_singleton: None,
             option: None,
@@ -121,6 +125,27 @@ impl TxRecord {
             submitted_at,
         }
     }
+}
+
+/// Cached view of the Pot Potato lineage.
+///
+/// The potato is a plain coin lineage with no fixed puzzle hash to query, so following it
+/// means walking the chain hop by hop. Remembering where the walk ended last time keeps
+/// repeat runs down to a single lookup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PotatoCache {
+    /// Resolved holder tenures, newest first. The first entry's coin is the anchor the
+    /// next walk starts from.
+    #[serde(default)]
+    pub holds: Vec<HoldJson>,
+}
+
+/// Serializable form of one holder's tenure with the potato.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoldJson {
+    pub coin: CoinJson,
+    pub holder: String,
+    pub acquired_at: u64,
 }
 
 /// Serializable form of a [`Coin`].
